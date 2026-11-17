@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#eef1ea">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Control remoto · Atril</title>
+  <link rel="icon" href="icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    .rbtn.main.play { height: 84px; font-size: 21px; }
+    .tpad {
+      position: relative; height: 240px; border-radius: 22px; overflow: hidden;
+      background: var(--card); box-shadow: var(--shadow); touch-action: none; user-select: none; -webkit-user-select: none; cursor: grab;
+    }
+    .tpad.on { background: var(--accent-tint); }
+    /* rayas que se mueven con el dedo para que se sienta como deslizar texto */
+    .tpad-lines {
+      position: absolute; inset: -60px 0; pointer-events: none;
+      background: repeating-linear-gradient(to bottom, transparent 0 29px, var(--sep) 29px 30px);
+      background-position: 0 var(--off, 0px);
+    }
+    .tpad-hint { position: absolute; inset: auto 0 14px; text-align: center; font-size: 14px; font-weight: 500; color: var(--text-2); pointer-events: none; }
+    .tkeys { display: grid; grid-template-columns: repeat(3, 1fr); grid-template-areas: ". up ." "left down right"; gap: 12px; }
+    .tk { flex-direction: column; gap: 0; font-size: 26px; height: 78px; touch-action: manipulation; user-select: none; -webkit-user-select: none; }
+    .tk small { font-size: 12px; font-weight: 600; color: var(--text-2); }
+    .tk.up { grid-area: up; } .tk.left { grid-area: left; } .tk.down { grid-area: down; } .tk.right { grid-area: right; }
+    .tk.held { background: var(--accent-tint); }
+  </style>
+</head>
+<body>
+  <div class="remote-wrap">
+    <a class="btn plain" href="./#/ajustes" style="margin-bottom:4px">‹ Volver a Atril</a>
+    <div class="large-title"><h1>Control<span class="sub"><span class="sync-dot" id="st">Conectando…</span></span></h1></div>
+
+    <div class="group">
+      <label class="cell"><div class="t"><b>Abrir nota en el iPad</b></div>
+        <select id="nota" aria-label="Nota"><option value="">Elegir…</option></select></label>
+    </div>
+
+    <div class="remote-pad">
+      <button class="rbtn main play" data-cmd="play">▶︎ ❚❚&nbsp; Iniciar / Pausar</button>
+
+      <!-- panel táctil: deslizas el dedo y el texto del iPad se mueve igual que en un celular -->
+      <div class="tpad" id="tpad" aria-label="Panel para deslizar el texto">
+        <div class="tpad-lines" id="tpadLines"></div>
+        <span class="tpad-hint">Desliza aquí para mover el texto</span>
+      </div>
+
+      <!-- flechas en T invertida: ▲▼ una línea (mantén presionado para seguir), ◀▶ canción -->
+      <div class="tkeys">
+        <button class="rbtn tk up" data-line="-1" aria-label="Subir una línea">▲<small>línea</small></button>
+        <button class="rbtn tk left" data-cmd="prev" aria-label="Canción anterior">◀<small>canción</small></button>
+        <button class="rbtn tk down" data-line="1" aria-label="Bajar una línea">▼<small>línea</small></button>
+        <button class="rbtn tk right" data-cmd="next" aria-label="Canción siguiente">▶<small>canción</small></button>
+      </div>
+
+      <div class="r2">
+        <button class="rbtn" data-cmd="slower">− Velocidad</button>
+        <button class="rbtn" data-cmd="faster">+ Velocidad</button>
+      </div>
+      <div class="r3">
+        <button class="rbtn" data-cmd="speed:4">Lenta</button>
+        <button class="rbtn" data-cmd="speed:6">Normal</button>
+        <button class="rbtn" data-cmd="speed:9">Rápida</button>
+      </div>
+      <div class="r2">
+        <button class="rbtn" data-cmd="smaller">A − Letra</button>
+        <button class="rbtn" data-cmd="bigger">A + Letra</button>
+      </div>
+      <div class="r2">
+        <button class="rbtn" data-cmd="top">⤒ Inicio</button>
+        <button class="rbtn" data-cmd="exit">✕ Cerrar</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    const st = document.getElementById("st");
+    const ok = (yes, msg) => { st.className = "sync-dot " + (yes ? "ok" : "err"); st.textContent = msg; };
+    // muestra si hay alguna pantalla (iPad/PC) con Atril abierto escuchando el control
+    const show = (screens) => screens > 0
+      ? ok(true, screens === 1 ? "Conectado · 1 pantalla" : `Conectado · ${screens} pantallas`)
+      : ok(false, "Conectado, pero abre Atril en el iPad");
+    async function call(url, opts) {
+      const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 4000);
+      try { const r = await fetch(url, { cache: "no-store", ...opts, signal: ctl.signal }); if (!r.ok) throw 0; return await r.json(); }
+      finally { clearTimeout(to); }
+    }
+    async function send(body) {
+      const opts = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+      for (let i = 0; i < 3; i++) {   // si la WiFi falla un instante, reintenta sin que lo notes
+        try {
+          const d = await call("api/cmd", opts);
+          show(d.screens); if (navigator.vibrate && !/^drag:/.test(body.cmd)) navigator.vibrate(15); return;
+        } catch { await new Promise((r) => setTimeout(r, 400)); }
+      }
+      ok(false, "Sin conexión con la PC · revisa la WiFi");
+    }
+    async function status() {
+      if (document.visibilityState !== "visible") return;
+      try { show((await call("api/ping")).screens); } catch { ok(false, "Sin conexión con la PC · revisa la WiFi"); }
+    }
+    setInterval(status, 4000);
+    document.addEventListener("visibilitychange", status);
+    document.querySelectorAll("[data-cmd]").forEach((b) => (b.onclick = () => send({ cmd: b.dataset.cmd })));
+
+    // ▲ ▼ : una línea por toque; si lo mantienes presionado sigue moviéndose línea por línea
+    document.querySelectorAll("[data-line]").forEach((b) => {
+      let t1 = 0, t2 = 0;
+      const stop = () => { clearTimeout(t1); clearInterval(t2); b.classList.remove("held"); };
+      b.addEventListener("pointerdown", (e) => {
+        e.preventDefault(); stop(); b.classList.add("held");
+        const go = () => send({ cmd: "line:" + b.dataset.line });
+        go();
+        t1 = setTimeout(() => (t2 = setInterval(go, 170)), 420);
+      });
+      ["pointerup", "pointercancel", "pointerleave"].forEach((ev) => b.addEventListener(ev, stop));
+      b.addEventListener("contextmenu", (e) => e.preventDefault());
+    });
+
+    // Panel táctil: el movimiento del dedo se convierte en líneas del iPad.
+    // Deslizar hacia arriba = el texto avanza (igual que en el celular). 30 px de dedo = 1 línea.
+    const PX_POR_LINEA = 30;
+    const pad = document.getElementById("tpad"), stripes = document.getElementById("tpadLines");
+    let lastY = null, pend = 0, off = 0, flushT = 0, sending = false;
+    async function flush() {
+      flushT = 0;
+      if (sending || Math.abs(pend) < 0.05) return;
+      const n = Math.round(pend * 100) / 100; pend -= n; sending = true;
+      try { await send({ cmd: "drag:" + n }); } finally { sending = false; if (Math.abs(pend) >= 0.05) flushT = setTimeout(flush, 0); }
+    }
+    pad.addEventListener("pointerdown", (e) => { pad.setPointerCapture(e.pointerId); lastY = e.clientY; pad.classList.add("on"); });
+    pad.addEventListener("pointermove", (e) => {
+      if (lastY == null) return;
+      const dy = e.clientY - lastY; lastY = e.clientY;
+      pend += -dy / PX_POR_LINEA;
+      off = (off + dy) % 30; stripes.style.setProperty("--off", off + "px");
+      if (!flushT) flushT = setTimeout(flush, 60);   // se juntan los movimientos y se mandan ~15 veces por segundo
+    });
+    const end = () => { lastY = null; pad.classList.remove("on"); if (!flushT) flushT = setTimeout(flush, 0); };
+    pad.addEventListener("pointerup", end); pad.addEventListener("pointercancel", end);
+    document.getElementById("nota").onchange = (e) => { if (e.target.value) send({ cmd: "open", nota: e.target.value }); };
+    fetch("api/state").then((r) => r.json()).then(({ data }) => {
+      status();
+      const notas = (data && data.notas || []).filter((n) => !n.del).sort((a, b) => (b.modificado || "").localeCompare(a.modificado || ""));
+      document.getElementById("nota").insertAdjacentHTML("beforeend",
+        notas.map((n) => `<option value="${n.id.replace(/"/g, "")}">${n.titulo.replace(/[<&]/g, "")}</option>`).join(""));
+      if (!notas.length) document.getElementById("nota").insertAdjacentHTML("beforeend", "<option disabled>Abre Atril una vez en el iPad para ver tus notas</option>");
+    }).catch(() => ok(false, "Abre esta página desde la PC con server.py"));
+  </script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+# Datos personales: nunca se suben a GitHub
+data/mis-datos.js
+listas/
+atril-sync.json
+*.json.tmp
+
+# Generados
+publicar/
+__pycache__/
