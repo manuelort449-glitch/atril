@@ -357,7 +357,9 @@
   // El iPad y el teléfono solo necesitan estar en la misma red; el hotspot del teléfono
   // sirve aunque no tenga datos. Se intercambian dos códigos QR (la "oferta" del iPad y la
   // "respuesta" del teléfono) y desde ahí se hablan directo con WebRTC, sin servidor.
-  const QR_PREFIX = "AT1";
+  const QR_PREFIX = "AT1";   // formato anterior: la descripción completa comprimida (QR grande)
+  const QR_PREFIX2 = "AT2";  // formato compacto: solo los datos que cambian (QR chico, fácil de leer)
+  const isAtrilCode = (s) => /^AT[12]/.test(s || "");
   const loadScript = (src, global) => new Promise((ok, no) => {
     if (window[global]) return ok();
     const s = document.createElement("script"); s.src = src; s.onload = ok; s.onerror = () => no(new Error("No se pudo cargar " + src));
@@ -365,6 +367,7 @@
   });
   const b64urlDecode = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
   const streamBytes = async (bytes, stream) => new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(stream)).arrayBuffer());
+  const hex = (bytes) => [...bytes].map((x) => x.toString(16).padStart(2, "0")).join("");
 
   /** Deja solo lo necesario de la descripción de conexión para que el QR sea chico. */
   function slimSdp(sdp) {
@@ -375,13 +378,72 @@
     const keep = new Set(v4.length ? v4 : udp.length ? udp : cands);
     return lines.filter((l) => !l.startsWith("a=candidate:") || keep.has(l)).join("\r\n") + "\r\n";
   }
+
+  // Formato compacto (≈110 letras en vez de ≈570): tipo, rol, usuario y clave de conexión,
+  // huella del certificado y las direcciones del aparato. El resto de la descripción es igual
+  // en todos los aparatos y se vuelve a armar del otro lado (expandSdp).
+  const SETUPS = ["actpass", "active", "passive"];
+  function compactSdp(desc) {
+    const sdp = desc.sdp;
+    const get = (k) => { const m = sdp.match(new RegExp("^a=" + k + ":(.*)$", "m")); return m ? m[1].trim() : ""; };
+    const ufrag = get("ice-ufrag"), pwd = get("ice-pwd"), mid = get("mid"), setup = SETUPS.indexOf(get("setup"));
+    const fp = get("fingerprint").match(/^sha-256 ((?:[0-9A-F]{2}:){31}[0-9A-F]{2})$/i);
+    const ascii = (s) => /^[\x21-\x7e]{1,64}$/.test(s);
+    if ((sdp.match(/^m=/gm) || []).length !== 1 || !/^m=application \S+ UDP\/DTLS\/SCTP webrtc-datachannel/m.test(sdp)) return null;
+    if (!ascii(ufrag) || !ascii(pwd) || !ascii(mid) || setup < 0 || !fp) return null;
+    const v4 = [], mdns = [], seen = new Set();
+    for (const l of sdp.split(/\r?\n/)) {
+      const p = l.split(" ");
+      if (!l.startsWith("a=candidate:") || p[1] !== "1" || !/^udp$/i.test(p[2]) || p[7] !== "host") continue;
+      const ip = p[4], port = +p[5];
+      if (seen.has(ip + ":" + port) || !(port > 0 && port < 65536)) continue;
+      seen.add(ip + ":" + port);
+      const a = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+      const u = ip.match(/^([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{4})-([0-9a-f]{12})\.local$/i);
+      if (a) v4.push([0, ...a.slice(1).map(Number), port >> 8, port & 255]);
+      else if (u) mdns.push([1, ...u.slice(1).join("").match(/../g).map((h) => parseInt(h, 16)), port >> 8, port & 255]);
+    }
+    const cands = [...v4, ...mdns].slice(0, 5);
+    if (!cands.length) return null;
+    const str = (s) => [s.length, ...[...s].map((c) => c.charCodeAt(0))];
+    const bytes = [desc.type === "offer" ? 1 : 2, setup, ...str(ufrag), ...str(pwd), ...str(mid),
+      ...fp[1].split(":").map((h) => parseInt(h, 16)), cands.length, ...cands.flat()];
+    return QR_PREFIX2 + b64url(Uint8Array.from(bytes));
+  }
+  function expandSdp(b) {
+    let i = 0;
+    const take = (n) => { if (i + n > b.length) throw new Error("código incompleto"); return b.slice(i, (i += n)); };
+    const str = () => String.fromCharCode(...take(take(1)[0]));
+    const type = take(1)[0] === 1 ? "offer" : "answer", setup = SETUPS[take(1)[0]];
+    const ufrag = str(), pwd = str(), mid = str();
+    const fp = hex(take(32)).toUpperCase().match(/../g).join(":");
+    const n = take(1)[0], cands = [];
+    for (let k = 0; k < n; k++) {
+      const kind = take(1)[0];
+      let ip;
+      if (kind === 0) ip = [...take(4)].join(".");
+      else { const h = hex(take(16)); ip = `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}.local`; }
+      const pb = take(2);
+      cands.push(`a=candidate:${k + 1} 1 udp ${2122260223 - k} ${ip} ${(pb[0] << 8) | pb[1]} typ host generation 0`);
+    }
+    if (!setup) throw new Error("código dañado");
+    const sdp = ["v=0", `o=- ${Date.now()} 2 IN IP4 127.0.0.1`, "s=-", "t=0 0", `a=group:BUNDLE ${mid}`, "a=msid-semantic: WMS",
+      "m=application 9 UDP/DTLS/SCTP webrtc-datachannel", "c=IN IP4 0.0.0.0", ...cands,
+      `a=ice-ufrag:${ufrag}`, `a=ice-pwd:${pwd}`, "a=ice-options:trickle", `a=fingerprint:sha-256 ${fp}`,
+      `a=setup:${setup}`, `a=mid:${mid}`, "a=sctp-port:5000", "a=max-message-size:262144"].join("\r\n") + "\r\n";
+    return { type, sdp };
+  }
+
   async function packSdp(desc) {
+    const small = compactSdp(desc);
+    if (small) return small;
     let bytes = new TextEncoder().encode(desc.type[0] + slimSdp(desc.sdp)), mode = "p";
     if (window.CompressionStream) { try { bytes = await streamBytes(bytes, new CompressionStream("deflate-raw")); mode = "z"; } catch {} }
     return QR_PREFIX + mode + b64url(bytes);
   }
   async function unpackSdp(code) {
-    code = String(code || "").trim();
+    code = String(code || "").replace(/\s+/g, "");
+    if (code.startsWith(QR_PREFIX2)) return expandSdp(b64urlDecode(code.slice(QR_PREFIX2.length)));
     if (!code.startsWith(QR_PREFIX)) throw new Error("Ese código no es de Atril");
     let bytes = b64urlDecode(code.slice(QR_PREFIX.length + 1));
     if (code[QR_PREFIX.length] === "z") bytes = await streamBytes(bytes, new DecompressionStream("deflate-raw"));
@@ -390,7 +452,8 @@
   }
   async function qrSvg(text) {
     await loadScript("vendor/qrcode.js", "qrcode");
-    const q = window.qrcode(0, "L"); q.addData(text, "Byte"); q.make();
+    // Con el código corto alcanza para más corrección de errores (se lee mejor con reflejos).
+    const q = window.qrcode(0, text.length <= 200 ? "M" : "L"); q.addData(text, "Byte"); q.make();
     return q.createSvgTag({ cellSize: 4, margin: 4, scalable: true });
   }
   /** Espera a que el aparato termine de juntar sus direcciones de red (máx. 4 s). */
@@ -399,32 +462,54 @@
     pc.addEventListener("icegatheringstatechange", () => { if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); } });
   });
 
-  /** Cámara + lector de QR (jsQR, incluido en la app para funcionar sin internet). */
+  /** Cámara + lector de QR. Usa el lector del sistema si existe (Android) y si no jsQR,
+   *  incluido en la app para funcionar sin internet. onCode devuelve true si el código sirvió;
+   *  si no, la cámara sigue buscando. */
   const Cam = {
     stream: null, timer: 0,
     async start(video, facing, onCode) {
       this.stop();
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("Este navegador no permite usar la cámara aquí (necesita https)");
-      await loadScript("vendor/jsQR.js", "jsQR");
+      let det = null;
+      if ("BarcodeDetector" in window) {
+        try { if ((await window.BarcodeDetector.getSupportedFormats()).includes("qr_code")) det = new window.BarcodeDetector({ formats: ["qr_code"] }); } catch {}
+      }
+      const useJsQR = () => loadScript("vendor/jsQR.js", "jsQR");
+      if (!det) await useJsQR();
+      let stream;
       try {
-        this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        stream = this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
       } catch (e) {
         throw new Error(e.name === "NotAllowedError" ? "Permite el uso de la cámara para leer el código"
           : e.name === "NotFoundError" ? "No se encontró una cámara" : "No se pudo abrir la cámara");
       }
-      video.srcObject = this.stream; video.setAttribute("playsinline", ""); video.muted = true;
+      video.srcObject = stream; video.setAttribute("playsinline", ""); video.muted = true;
       await video.play().catch(() => {});
       const cv = document.createElement("canvas"), cx = cv.getContext("2d", { willReadFrequently: true });
-      const tick = () => {
-        if (!this.stream) return;
-        if (video.videoWidth) {
-          const s = Math.min(1, 800 / video.videoWidth);
-          cv.width = (video.videoWidth * s) | 0; cv.height = (video.videoHeight * s) | 0;
-          cx.drawImage(video, 0, 0, cv.width, cv.height);
-          const r = window.jsQR(cx.getImageData(0, 0, cv.width, cv.height).data, cv.width, cv.height, { inversionAttempts: "dontInvert" });
-          if (r && r.data && r.data.startsWith(QR_PREFIX)) { onCode(r.data); return; }
+      let last = "", lastT = 0;
+      const read = async () => {
+        if (det) {
+          try { const r = await det.detect(video); const hit = r.find((x) => isAtrilCode(x.rawValue)); return hit ? hit.rawValue : ""; }
+          catch { det = null; await useJsQR().catch(() => {}); return ""; }
         }
-        this.timer = setTimeout(tick, 160);
+        if (!window.jsQR) return "";
+        const s = Math.min(1, 1280 / video.videoWidth);
+        cv.width = (video.videoWidth * s) | 0; cv.height = (video.videoHeight * s) | 0;
+        cx.drawImage(video, 0, 0, cv.width, cv.height);
+        const r = window.jsQR(cx.getImageData(0, 0, cv.width, cv.height).data, cv.width, cv.height, { inversionAttempts: "attemptBoth" });
+        return r && isAtrilCode(r.data) ? r.data : "";
+      };
+      const tick = async () => {
+        if (this.stream !== stream) return;
+        const data = video.videoWidth ? await read() : "";
+        if (this.stream !== stream) return;
+        // el mismo código que ya falló no se vuelve a probar enseguida
+        if (data && (data !== last || Date.now() - lastT > 3000)) {
+          last = data; lastT = Date.now();
+          let ok = false; try { ok = await onCode(data); } catch {}
+          if (ok) return;
+        }
+        if (this.stream === stream) this.timer = setTimeout(tick, det ? 120 : 160);
       };
       tick();
     },
@@ -518,10 +603,13 @@
     const accept = async (code) => {
       try {
         const desc = await unpackSdp(code);
-        if (desc.type !== "answer") { pst("Ese es el código del iPad. Muestra el que aparece en el teléfono."); return; }
-        Cam.stop(); pst("Conectando…");
+        if (desc.type !== "answer") { pst("Ese es el código del iPad. Muestra el que aparece en el teléfono."); return false; }
+        if (!Link.pc || Link.pc.signalingState !== "have-local-offer") { pst("Espera a que aparezca el código del iPad."); return false; }
+        pst("Conectando…");
         await Link.pc.setRemoteDescription(desc);
-      } catch (e) { pst("No se pudo leer el código: " + e.message); }
+        Cam.stop();
+        return true;
+      } catch (e) { pst("No se pudo leer el código: " + e.message); return false; }
     };
     try { await Cam.start($("#cam", d), "user", accept); $("#camMsg", d).textContent = "Apunta aquí el código del teléfono"; }
     catch (e) { $("#camMsg", d).textContent = e.message || "No se pudo abrir la cámara"; }
@@ -1131,18 +1219,21 @@
       const go = async (code) => {
         try {
           const desc = await unpackSdp(code);
-          if (desc.type !== "offer") { $("#camMsg", el).textContent = "Ese es el código del teléfono. Escanea el del iPad."; return; }
-          Cam.stop();
-          $("#camMsg", el).textContent = "Preparando respuesta…";
+          if (desc.type !== "offer") { $("#camMsg", el).textContent = "Ese es el código del teléfono. Escanea el del iPad."; return false; }
+          if (navigator.vibrate) navigator.vibrate(30);
+          $("#camMsg", el).textContent = "¡Leído! Preparando respuesta…";
           const pc = Link.newPC("control");
           pc.ondatachannel = (e) => Link.bind(e.channel);
           await pc.setRemoteDescription(desc);
           await pc.setLocalDescription(await pc.createAnswer());
+          // la cámara sigue prendida hasta aquí: así el teléfono comparte su dirección real en la red
           await gathered(pc);
-          if (pc !== Link.pc) return;
+          Cam.stop();
+          if (pc !== Link.pc) return true;
           Link.answer = await packSdp(pc.localDescription);
           draw();
-        } catch (e) { const m = $("#camMsg", el); if (m) m.textContent = "No se pudo leer: " + e.message; }
+          return true;
+        } catch (e) { const m = $("#camMsg", el); if (m) m.textContent = "No se pudo leer: " + e.message; return false; }
       };
       $("#useCode", el).onclick = () => go($("#theirCode", el).value);
       Cam.start($("#cam", el), "environment", go)
