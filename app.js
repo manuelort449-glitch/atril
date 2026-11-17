@@ -839,9 +839,23 @@
         ${sw("loop", "Guion en bucle")}
         ${col("fg", "Color de fuente")}
         ${col("bg", "Color de fondo")}
+        <div class="dr-row bgm"><span>Foto, GIF o video de fondo<small>${BgMedia.url ? esc(BgMedia.name || "Elegido") : "Se ve detrás del texto"}</small></span>
+          <span class="dr-bg-btns"><label class="btn sm tint">${BgMedia.url ? "Cambiar" : "Elegir"}<input type="file" id="bgFile" accept="image/*,video/*" hidden></label>
+          ${BgMedia.url ? `<button class="btn sm plain danger" id="bgDel">Quitar</button>` : ""}</span></div>
+        ${BgMedia.url ? `<div class="dr-slider"><div class="dr-row plain"><span>Oscurecer el fondo</span><b id="dv-dim">${BgMedia.dim()} %</b></div>
+          <div class="dr-range"><span>0</span><input type="range" id="bgDim" min="0" max="90" step="5" value="${BgMedia.dim()}" aria-label="Oscurecer el fondo"><span>90</span></div></div>` : ""}
         ${link("#/ajustes", "gear", "Más ajustes y respaldo")}
       </div>`;
     const changed = () => { save({ sync: false }); if (P.open) applySettings(); };
+    if (!BgMedia.loaded) BgMedia.load().then(() => { if (document.body.classList.contains("drawer-open") && BgMedia.url) drawDrawer(); });
+    const bf = $("#bgFile", dr);
+    bf.onchange = async () => {
+      const f = bf.files && bf.files[0]; if (!f) return;
+      toast("Guardando fondo…");
+      try { await BgMedia.choose(f); toast("Fondo listo: abre un guion para verlo"); drawDrawer(); } catch (e) { toast(e.message || "No se pudo guardar el fondo"); }
+    };
+    if ($("#bgDel", dr)) $("#bgDel", dr).onclick = async () => { await BgMedia.clear(); toast("Fondo quitado"); drawDrawer(); };
+    if ($("#bgDim", dr)) $("#bgDim", dr).oninput = (e) => { BgMedia.setDim(+e.target.value); $("#dv-dim", dr).textContent = e.target.value + " %"; };
     $$("input[data-k]", dr).forEach((r) => (r.oninput = () => { a[r.dataset.k] = +r.value; $("#dv-" + r.dataset.k, dr).textContent = val(r.dataset.k, +r.value); changed(); }));
     $$("input[data-c]", dr).forEach((c) => (c.onchange = () => { a[c.dataset.c] = c.checked; changed(); }));
     $$("input[data-col]", dr).forEach((c) => (c.oninput = () => { a[c.dataset.col] = c.value; changed(); }));
@@ -1066,22 +1080,32 @@
         .map((l) => l.replace(/[ \t\u00a0]+$/g, "")).filter((l) => !junk.test(l.trim()))
         .join("\n").replace(/^.*\bLyrics\s*\n/i, "").replace(/\n{3,}/g, "\n\n").trim();
     },
-    /** Páginas donde buscar a mano cuando las fuentes automáticas no la tienen. */
-    webs(q) {
-      const e = encodeURIComponent;
-      return [
-        ["Letras.com", "https://www.letras.com/?q=" + e(q)],
-        ["Genius", "https://genius.com/search?q=" + e(q)],
-        ["Musica.com", "https://www.musica.com/letras.asp?t2=" + e(q)],
-        ["Google", "https://www.google.com/search?q=" + e(q + " letra")],
-      ];
-    },
     timed(p, ms) { return Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("tardó demasiado")), ms))]); },
-    async lrclib(q) {
-      const r = await fetch("https://lrclib.net/api/search?q=" + encodeURIComponent(q));
-      if (!r.ok) throw new Error("LRCLIB " + r.status);
-      return (await r.json()).filter((x) => x.plainLyrics && !x.instrumental).slice(0, 15)
-        .map((x) => ({ fuente: "LRCLIB", titulo: x.trackName, artista: x.artistName, album: x.albumName || "", letra: this.clean(x.plainLyrics) }));
+    /** LRCLIB: busca por título (y artista si lo diste) y por texto libre; la misma letra cantada por
+     *  varios grupos se junta en un solo resultado, y van primero los títulos más parecidos. */
+    async lrclib(title, artist) {
+      const e = encodeURIComponent;
+      const get = async (qs) => { const r = await fetch("https://lrclib.net/api/search?" + qs); if (!r.ok) throw new Error("LRCLIB " + r.status); return r.json(); };
+      const lists = await Promise.allSettled([
+        get("track_name=" + e(title) + (artist ? "&artist_name=" + e(artist) : "")),
+        get("q=" + e([title, artist].filter(Boolean).join(" "))),
+      ]);
+      if (lists.every((x) => x.status === "rejected")) throw lists[0].reason;
+      const groups = new Map(), seen = new Set();
+      for (const x of lists.filter((l) => l.status === "fulfilled").flatMap((l) => l.value)) {
+        if (seen.has(x.id) || !x.plainLyrics || x.instrumental) continue;
+        seen.add(x.id);
+        const letra = this.clean(x.plainLyrics), key = plain(letra).slice(0, 160);
+        const g = groups.get(key);
+        if (g) { if (!g.artistas.includes(x.artistName)) g.artistas.push(x.artistName); continue; }
+        groups.set(key, { fuente: "LRCLIB", titulo: x.trackName, artistas: [x.artistName], letra });
+      }
+      const pa = plain(artist);
+      return [...groups.values()].map((g) => {
+        let sc = Search.score(title, [[g.titulo, 1]]) * 2 + Math.log2(1 + g.artistas.length);
+        if (pa && g.artistas.some((a) => plain(a).includes(pa) || pa.includes(plain(a)))) sc += 6;
+        return { ...g, sc };
+      }).sort((a, b) => b.sc - a.sc).slice(0, 12);
     },
     async ovh(q) {
       const r = await fetch("https://api.lyrics.ovh/suggest/" + encodeURIComponent(q));
@@ -1090,7 +1114,7 @@
       return ((await r.json()).data || []).filter((x) => {
         const k = (x.artist.name + "|" + x.title).toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true;
       }).slice(0, 8).map((x) => ({
-        fuente: "Lyrics.ovh", titulo: x.title, artista: x.artist.name, album: x.album ? x.album.title : "", letra: null,
+        fuente: "Lyrics.ovh", titulo: x.title, artistas: [x.artist.name], letra: null,
         get: async () => {
           const g = await this.timed(fetch(`https://api.lyrics.ovh/v1/${encodeURIComponent(x.artist.name)}/${encodeURIComponent(x.title)}`), 20000);
           const j = g.ok ? await g.json() : {};
@@ -1099,12 +1123,15 @@
         },
       }));
     },
-    async search(q) {
-      const res = await Promise.allSettled([this.timed(this.lrclib(q), 15000), this.timed(this.ovh(q), 15000)]);
+    async search(title, artist) {
+      const res = await Promise.allSettled([this.timed(this.lrclib(title, artist), 15000),
+        this.timed(this.ovh([title, artist].filter(Boolean).join(" ")), 15000)]);
       const items = [], errs = [], seen = new Set();
       res.forEach((r) => (r.status === "fulfilled" ? items.push(...r.value) : errs.push(r.reason)));
-      return { errs, items: items.filter((x) => { const k = (x.artista + "|" + x.titulo).toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }) };
+      return { errs, items: items.filter((x) => { const k = plain(x.artistas[0] + "|" + x.titulo); if (seen.has(k)) return false; seen.add(k); return true; }) };
     },
+    /** Primeras dos líneas de la letra, para reconocer la canción sin abrirla. */
+    snippet(t) { return String(t || "").split("\n").map((l) => l.trim()).filter((l) => l && !/^\[.*\]$/.test(l)).slice(0, 2).join(" / "); },
   };
   /** Busca la letra de una canción y deja elegir cuál usar; muestra la letra debajo del resultado tocado. */
   function lyricsSheet(nombre, onUse, actual = "") {
@@ -1114,28 +1141,26 @@
         <label class="cell"><div class="t"><b>Artista</b><span>Opcional, ayuda a encontrarla</span></div><input type="text" id="la" placeholder="ej. Los Ángeles Azules"></label>
       </div>
       <div class="row" style="margin-top:10px"><button class="btn fill" id="lgo">${ic("search")} Buscar</button></div>
-      <p class="section-f" id="lst">Busca en LRCLIB y Lyrics.ovh (gratis). Toca un resultado para ver la letra.</p>
+      <p class="section-f" id="lst">Toca un resultado para ver la letra completa.</p>
       <div class="group" id="lres"></div>
-      <div class="section-h">¿No está? Búscala en la web</div>
-      <div class="lyr-webs" id="lwebs"></div>
-      <p class="section-f">Abre la página, copia la letra (mantén presionado → Seleccionar → Copiar), regresa a Atril y toca <b>Pegar letra</b>.</p>
-      <div class="row"><button class="btn tint" id="lpst">Pegar letra</button></div>
+      <p class="section-f">¿No aparece? <a id="lweb" target="_blank" rel="noopener">Búscala en Letras.com</a>, cópiala y toca <a href="#" id="lpst">Pegar letra</a>.</p>
       <div id="lman" hidden>
         <textarea class="editor" id="lpaste" style="min-height:22vh" placeholder="Mantén presionado aquí y toca Pegar"></textarea>
         <div class="row"><span class="spacer"></span><button class="btn fill sm" id="luse">Usar este texto</button></div>
       </div>`, { el: "#sheet2" });
     let items = [];
-    const q = () => [$("#lq", d).value.trim(), $("#la", d).value.trim()].filter(Boolean).join(" ");
+    const title = () => $("#lq", d).value.trim(), artist = () => $("#la", d).value.trim();
+    const q = () => [title(), artist()].filter(Boolean).join(" ");
     const st = (t) => ($("#lst", d).textContent = t);
-    const gen = () => ($("#lwebs", d).innerHTML = Lyrics.webs(q() || nombre)
-      .map(([n, u]) => `<a class="btn sm tint" href="${esc(u)}" target="_blank" rel="noopener">${esc(n)}</a>`).join(""));
+    const gen = () => ($("#lweb", d).href = "https://www.letras.com/?q=" + encodeURIComponent(q() || nombre));
     const use = (t) => {
       t = Lyrics.clean(t);
       if (t.length < 20) { toast("Eso no parece una letra: copia la letra completa"); return; }
       if (actual.trim() && !confirm("Esta canción ya tiene letra. ¿Cambiarla por la nueva?")) return;
       onUse(t); d.close();
     };
-    $("#lpst", d).onclick = async () => {
+    $("#lpst", d).onclick = async (e) => {
+      e.preventDefault();
       let t = "";
       try { t = await navigator.clipboard.readText(); } catch {}
       if (t && t.trim().length >= 20) return use(t);
@@ -1145,18 +1170,21 @@
     };
     $("#luse", d).onclick = () => use($("#lpaste", d).value);
     const run = async () => {
-      const text = q();
       gen();
-      if (!text) return st("Escribe el nombre de la canción");
+      if (!title()) return st("Escribe el nombre de la canción");
       if (!navigator.onLine) return st("Sin internet: conéctate para buscar letras.");
       st("Buscando…"); $("#lres", d).innerHTML = "";
-      const r = await Lyrics.search(text);
+      const r = await Lyrics.search(title(), artist());
       items = r.items;
       if (!items.length) return st(r.errs.length === 2 ? "No se pudo buscar (" + r.errs[0].message + "). Revisa el internet."
-        : "No está en las fuentes automáticas. Búscala en la web (abajo): Letras.com tiene mucha música regional.");
-      st(`${items.length} resultados. Toca uno para ver la letra.`);
-      $("#lres", d).innerHTML = items.map((x, i) => `<button class="cell" data-i="${i}"><div class="t"><b class="wrap">${esc(x.titulo)}</b>
-          <span>${esc(x.artista)}${x.album ? " · " + esc(x.album) : ""}</span></div><span class="tag lyr">${x.fuente}</span></button>`).join("");
+        : "No apareció. Prueba escribiendo también el artista.");
+      st(items.length === 1 ? "Toca el resultado para ver la letra completa." : `${items.length} letras distintas. Toca una para verla completa.`);
+      $("#lres", d).innerHTML = items.map((x, i) => {
+        const more = x.artistas.length > 1 ? ` y ${x.artistas.length - 1} más` : "";
+        const snip = x.letra ? Lyrics.snippet(x.letra) : "";
+        return `<button class="cell lyr-hit" data-i="${i}"><div class="t"><b class="wrap">${esc(x.titulo)}</b>
+          <span>${esc(x.artistas[0])}${more}</span>${snip ? `<span class="lyr-snip">${esc(snip)}…</span>` : ""}</div></button>`;
+      }).join("");
     };
     $("#lq", d).oninput = $("#la", d).oninput = gen;
     $("#lq", d).onkeydown = $("#la", d).onkeydown = (e) => { if (e.key === "Enter") run(); };
@@ -1174,7 +1202,7 @@
       try { if (x.letra == null) x.letra = await x.get(); }
       catch (err) { box.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
       box.innerHTML = `<pre class="lyr-text">${esc(x.letra)}</pre>
-        <div class="row"><span class="small muted">${esc(x.fuente)}</span><span class="spacer"></span><button class="btn fill sm" data-use="${i}">Usar esta letra</button></div>`;
+        <div class="row"><span class="small muted">${esc(x.artistas.slice(0, 4).join(", "))}${x.artistas.length > 4 ? "…" : ""}</span><span class="spacer"></span><button class="btn fill sm" data-use="${i}">Usar esta letra</button></div>`;
     };
     gen();
     if (nombre.trim()) run();
@@ -1778,6 +1806,57 @@
   }
   function flashSpeed(v) { const el = $("#pSpeed"); el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash"); el.textContent = fmtSpeed(v); }
 
+  // ---- Fondo del teleprompter: foto, GIF o video. Se guarda solo en este aparato (IndexedDB),
+  // no se sincroniza porque puede pesar mucho. "Oscurecer" pone una capa negra encima para leer bien.
+  const BgMedia = {
+    url: "", kind: "", name: "", loaded: false, K: "atril:fondo-oscuro",
+    db() {
+      return new Promise((ok, no) => {
+        const r = indexedDB.open("atril-media", 1);
+        r.onupgradeneeded = () => r.result.createObjectStore("m");
+        r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error);
+      });
+    },
+    async io(mode, fn) {
+      const db = await this.db();
+      return new Promise((ok, no) => { const tx = db.transaction("m", mode), q = fn(tx.objectStore("m")); tx.oncomplete = () => ok(q && q.result); tx.onerror = () => no(tx.error); });
+    },
+    async load() {
+      if (this.loaded) return;
+      this.loaded = true;
+      try { const r = await this.io("readonly", (st) => st.get("fondo")); if (r && r.blob) this.set(r.blob, r.kind, r.name); } catch {}
+    },
+    set(blob, kind, name) {
+      if (this.url) URL.revokeObjectURL(this.url);
+      this.url = blob ? URL.createObjectURL(blob) : ""; this.kind = blob ? kind : ""; this.name = blob ? name || "" : "";
+    },
+    async choose(file) {
+      const kind = /^video\//.test(file.type) ? "video" : /^image\//.test(file.type) ? "image" : "";
+      if (!kind) throw new Error("Elige una foto, un GIF o un video");
+      if (file.size > 300 * 1024 * 1024) throw new Error("El archivo es muy grande (máximo 300 MB)");
+      await this.io("readwrite", (st) => st.put({ blob: file, kind, name: file.name }, "fondo"));
+      this.set(file, kind, file.name); this.render();
+    },
+    async clear() { try { await this.io("readwrite", (st) => st.delete("fondo")); } catch {} this.set(null); this.render(); },
+    dim() { const v = localStorage.getItem(this.K); return v === null ? 40 : +v; },
+    setDim(v) { localStorage.setItem(this.K, String(v)); this.render(); },
+    render() {
+      const box = $("#pBg"), pr = $("#prompter"); if (!box) return;
+      pr.classList.toggle("has-bg", !!this.url);
+      if (!this.url) { box.innerHTML = ""; box.hidden = true; return; }
+      box.hidden = false;
+      pr.style.setProperty("--p-dim", this.dim() / 100);
+      const cur = box.firstElementChild;
+      if (!cur || cur.dataset.src !== this.url) {
+        box.innerHTML = this.kind === "video"
+          ? `<video data-src="${this.url}" src="${this.url}" muted loop playsinline autoplay></video>`
+          : `<img data-src="${this.url}" src="${this.url}" alt="">`;
+      }
+      const v = $("video", box);
+      if (v) { v.muted = true; if (P.open) v.play().catch(() => {}); else v.pause(); }
+    },
+  };
+
   function openPrompter(id) {
     let titulo, texto;
     if (id === "tmp" && tempText) ({ titulo, texto } = tempText);
@@ -1794,6 +1873,7 @@
     $("#prompter").hidden = false; document.body.style.overflow = "hidden";
     $("#navbar").hidden = true; $("#view").hidden = true;
     applySettings(); $("#pScroll").scrollTop = 0; progress(); pause(); showUI();
+    BgMedia.load().then(() => BgMedia.render());
     const pr = $("#prompter");
     try { const f = pr.requestFullscreen || pr.webkitRequestFullscreen; if (f) Promise.resolve(f.call(pr)).catch(() => {}); } catch {}
     keepAwake(true);
@@ -1804,6 +1884,7 @@
     if (P.baseSpeed != null) { state.ajustes.speed = P.baseSpeed; save({ sync: false }); }
     $("#pSpeedMenu") && $("#pSpeedMenu").remove();
     $("#prompter").hidden = true; document.body.style.overflow = "";
+    BgMedia.render(); // pausa el video de fondo
     $("#navbar").hidden = false; $("#view").hidden = false;
     try { if (document.fullscreenElement) document.exitFullscreen(); } catch {}
     if (nav) { if (history.length > 1) history.back(); else location.hash = "#/notas"; }
