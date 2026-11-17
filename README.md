@@ -84,6 +84,18 @@ muestra el QR del teléfono a la cámara del iPad. Quedan conectados directo (We
 Después de la primera vez el iPad **recuerda el teléfono**: basta con que el teléfono escanee el código
 del iPad (el teléfono guarda un certificado fijo y el iPad su huella). Para otro teléfono: **Usar otro teléfono**.
 
+**Respaldo por internet (v11):** si los dos aparatos tienen internet (WiFi o datos, aunque sea en redes
+distintas), al escanear el código del iPad también se conectan a servidores públicos de mensajes (MQTT:
+HiveMQ, EMQX y Mosquitto). Todo va **cifrado** (AES-GCM) con una clave que solo viaja dentro del QR:
+los servidores no pueden leer nada. Con eso:
+- la respuesta del teléfono llega sola al iPad (no hace falta mostrarle el código del teléfono);
+- si el enlace directo falla, el control sigue funcionando por internet y el iPad vuelve a intentar el
+  directo solo (hasta 3 veces); en el control se ve *Conectado directo* o *Conectado por internet*;
+- si el iPad recordaba otro teléfono, ya no lo rechaza: se conecta igual y recuerda el nuevo.
+Por internet los archivos (fondo, foto o video del mensaje) pueden ser de hasta 25 MB.
+Sin internet funciona como antes (los dos en la misma red WiFi o en el hotspot). La pantalla de conexión
+muestra la versión y el estado (*directo* / *internet*) para saber qué está fallando.
+
 ### Hacer cambios sin romper lo publicado (ramas)
 
 - `main` = lo que está publicado y usa el iPad.

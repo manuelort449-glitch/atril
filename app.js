@@ -19,6 +19,7 @@
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const plain = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const APP_VERSION = "v11";
   const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-3);
   const today = () => new Date().toISOString().slice(0, 10);
   const now = () => Date.now();
@@ -433,7 +434,6 @@
       else if (u) mdns.push([1, ...u.slice(1).join("").match(/../g).map((h) => parseInt(h, 16)), port >> 8, port & 255]);
     }
     const cands = [...v4, ...mdns].slice(0, 5);
-    if (!cands.length) return null;
     const str = (s) => [s.length, ...[...s].map((c) => c.charCodeAt(0))];
     const bytes = [desc.type === "offer" ? 1 : 2, setup, ...str(ufrag), ...str(pwd), ...str(mid),
       ...fp[1].split(":").map((h) => parseInt(h, 16)), cands.length, ...cands.flat(), ...extra];
@@ -466,8 +466,8 @@
       `a=setup:${setup}`, `a=mid:${mid}`, "a=sctp-port:5000", "a=max-message-size:262144"].join("\r\n") + "\r\n";
   }
 
-  async function packSdp(desc) {
-    const small = compactSdp(desc);
+  async function packSdp(desc, extra = []) {
+    const small = compactSdp(desc, extra);
     if (small) return small;
     let bytes = new TextEncoder().encode(desc.type[0] + slimSdp(desc.sdp)), mode = "p";
     if (window.CompressionStream) { try { bytes = await streamBytes(bytes, new CompressionStream("deflate-raw")); mode = "z"; } catch {} }
@@ -500,6 +500,17 @@
   // mostrar su código. El usuario y la clave de conexión del teléfono se calculan igual en los dos
   // lados a partir de los del iPad (derivedIce); la seguridad la da la huella del certificado.
   const QUICK = 9; // marca en el código del iPad: "espero al teléfono que ya conozco"
+  const RELAY = 7; // marca en el código del iPad: clave del respaldo por internet (16 bytes)
+  /** Lee las marcas extra del código del iPad. */
+  function readExtra(x = []) {
+    const out = { quick: null, key: null };
+    for (let i = 0; i < x.length;) {
+      if (x[i] === QUICK && i + 3 <= x.length) { out.quick = x.slice(i + 1, i + 3); i += 3; }
+      else if (x[i] === RELAY && i + 17 <= x.length) { out.key = Uint8Array.from(x.slice(i + 1, i + 17)); i += 17; }
+      else break;
+    }
+    return out;
+  }
   const sdpGet = (sdp, k) => { const m = sdp.match(new RegExp("^a=" + k + ":(.*)$", "m")); return m ? m[1].trim() : ""; };
   const fpOf = (sdp) => { const m = sdpGet(sdp, "fingerprint").match(/^sha-256 (\S+)$/i); return m ? m[1].toUpperCase() : ""; };
   const fpHint = (fp) => fp.split(":").slice(0, 2).map((h) => parseInt(h, 16));
@@ -592,52 +603,267 @@
     stop() { clearTimeout(this.timer); if (this.stream) this.stream.getTracks().forEach((t) => t.stop()); this.stream = null; },
   };
 
+  // ---- Respaldo por internet ----
+  // Si los dos aparatos tienen internet, además del enlace directo se conectan a servidores públicos de
+  // mensajes (MQTT). Todo va cifrado con una clave que solo viaja dentro del código QR: el servidor no
+  // puede leer nada. Sirve para pasar la respuesta del teléfono sin mostrar su código, volver a intentar
+  // el enlace directo solo, y seguir funcionando aunque el enlace directo no se pueda.
+  const RELAY_URLS = ["wss://broker.hivemq.com:8884/mqtt", "wss://broker.emqx.io:8084/mqtt", "wss://test.mosquitto.org:8081/mqtt"];
+  const relayOK = () => !!(window.isSecureContext && window.crypto && crypto.subtle && window.WebSocket);
+  const catBytes = (...xs) => {
+    const out = new Uint8Array(xs.reduce((n, x) => n + x.length, 0)); let o = 0;
+    xs.forEach((x) => { out.set(x, o); o += x.length; }); return out;
+  };
+  const b64big = (bytes) => { let t = ""; for (let i = 0; i < bytes.length; i += 8192) t += String.fromCharCode(...bytes.subarray(i, i + 8192)); return btoa(t); };
+  /** Cliente MQTT mínimo sobre WebSocket: conectar, suscribirse a un tema y publicar. */
+  function mqtt(url, topic, onData, onState) {
+    const enc = new TextEncoder();
+    const str = (x) => { const b = enc.encode(x); return catBytes(Uint8Array.of(b.length >> 8, b.length & 255), b); };
+    const pkt = (h, body) => {
+      const len = []; let n = body.length;
+      do { let d = n % 128; n = Math.floor(n / 128); if (n) d |= 128; len.push(d); } while (n);
+      return catBytes(Uint8Array.of(h, ...len), body);
+    };
+    let ws = null, open = false, closed = false, buf = new Uint8Array(0), ping = 0, retry = 0;
+    const c = {
+      get open() { return open; },
+      get buffered() { return ws ? ws.bufferedAmount : 0; },
+      publish(data) { if (!open) return false; try { ws.send(pkt(0x30, catBytes(str(topic), data))); return true; } catch { return false; } },
+      close() { closed = true; open = false; clearInterval(ping); clearTimeout(retry); try { ws && ws.close(); } catch {} },
+    };
+    const down = () => { const was = open; open = false; clearInterval(ping); if (was) onState(); if (!closed) retry = setTimeout(connect, 4000); };
+    function connect() {
+      if (closed) return;
+      let me; try { me = ws = new WebSocket(url, "mqtt"); } catch { return down(); }
+      me.binaryType = "arraybuffer"; buf = new Uint8Array(0);
+      me.onopen = () => me.send(pkt(0x10, catBytes(Uint8Array.of(0, 4, 77, 81, 84, 84, 4, 2, 0, 60), str("atril-" + uid()))));
+      me.onclose = () => { if (me === ws) down(); };
+      me.onmessage = (e) => {
+        buf = catBytes(buf, new Uint8Array(e.data));
+        while (buf.length >= 2) {
+          let len = 0, mul = 1, i = 1, x;
+          do { if (i >= buf.length) return; x = buf[i++]; len += (x & 127) * mul; mul *= 128; } while (x & 128 && i < 5);
+          if (buf.length < i + len) return;
+          const h = buf[0], body = buf.slice(i, i + len); buf = buf.slice(i + len);
+          const type = h >> 4;
+          if (type === 2) { if (body[1] === 0) me.send(pkt(0x82, catBytes(Uint8Array.of(0, 1), str(topic), Uint8Array.of(0)))); else me.close(); }
+          else if (type === 9) { open = true; clearInterval(ping); ping = setInterval(() => { try { me.send(Uint8Array.of(0xc0, 0)); } catch {} }, 25000); onState(); }
+          else if (type === 3) { const tl = (body[0] << 8) | body[1]; onData(body.slice(2 + tl + ((h >> 1) & 3 ? 2 : 0))); }
+        }
+      };
+    }
+    connect();
+    return c;
+  }
+  const Relay = {
+    conns: [], key: null, me: "", seq: 0, last: 0, up: false, hbT: 0, queue: [], seen: new Set(), gen: 0,
+    tx: Promise.resolve(), rx: Promise.resolve(),
+    newKey() { return relayOK() ? crypto.getRandomValues(new Uint8Array(16)) : null; },
+    active() { return !!this.key; },
+    conn() { return this.conns.find((c) => c.open); },
+    async start(raw, role) {
+      this.stop(); const gen = this.gen;
+      if (!raw || !relayOK()) return;
+      try {
+        const key = await crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+        const topic = "atril/v1/" + hex(new Uint8Array(await crypto.subtle.digest("SHA-256", raw)).slice(0, 12));
+        if (gen !== this.gen) return;
+        this.key = key; this.me = role + "-" + uid();
+        this.conns = RELAY_URLS.map((u) => mqtt(u, topic, (d) => this.recv(d, gen), () => this.flush()));
+        this.hbT = setInterval(() => this.tick(), 3000);
+      } catch {}
+    },
+    stop() {
+      this.gen++; clearInterval(this.hbT); this.conns.forEach((c) => c.close());
+      this.conns = []; this.key = null; this.up = false; this.queue = []; this.seen = new Set(); this.seq = 0; this.last = 0;
+    },
+    /** Manda un mensaje cifrado; con queue, si todavía no hay servidor, lo guarda para mandarlo al conectar. */
+    send(m, queue = false, all = true) {
+      if (!this.key) return false;
+      if (!this.conn()) { if (queue && this.queue.length < 40) this.queue.push(m); return queue; }
+      const key = this.key, gen = this.gen, body = JSON.stringify({ s: this.me, n: ++this.seq, m });
+      this.tx = this.tx.then(async () => {
+        if (gen !== this.gen) return;
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(body)));
+        if (gen !== this.gen) return;
+        const data = catBytes(iv, ct);
+        // por todos los servidores conectados (el otro aparato descarta los repetidos); los pedazos de archivo, por uno solo
+        if (all) this.conns.forEach((c) => c.open && c.publish(data)); else { const c = this.conn(); if (c) c.publish(data); }
+      }).catch(() => {});
+      return true;
+    },
+    async drain() {
+      while (this.key && this.conn() && this.conn().buffered > 512 * 1024) await new Promise((r) => setTimeout(r, 40));
+      await this.tx;
+    },
+    flush() {
+      if (!this.conn()) return;
+      this.send({ t: "hb" });
+      const q = this.queue; this.queue = []; q.forEach((m) => this.send(m));
+    },
+    tick() {
+      this.send({ t: "hb" });
+      if (this.up && Date.now() - this.last > 12000) { this.up = false; Link.relayDown(); }
+    },
+    recv(d, gen) {
+      const key = this.key;
+      this.rx = this.rx.then(async () => {
+        if (gen !== this.gen || !key || d.length < 29) return;
+        let o; try { o = JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({ name: "AES-GCM", iv: d.slice(0, 12) }, key, d.slice(12)))); } catch { return; }
+        if (gen !== this.gen || !o || !o.m || o.s === this.me) return;
+        const id = o.s + ":" + o.n; if (this.seen.has(id)) return;
+        this.seen.add(id); if (this.seen.size > 400) this.seen = new Set([...this.seen].slice(-200));
+        this.last = Date.now();
+        if (!this.up) { this.up = true; Link.relayUp(); }
+        Link.fromRelay(o.m);
+      }).catch(() => {});
+    },
+  };
+  /** Texto corto para entender por qué no conecta (se ve en la pantalla de conexión). */
+  function linkDiag() {
+    const pc = Link.pc;
+    return [`Atril ${APP_VERSION}`,
+      "directo: " + (Link.dcOpen() ? "conectado" : pc ? ({ new: "preparando", checking: "probando", failed: "no se pudo", disconnected: "cortado" }[pc.iceConnectionState] || pc.iceConnectionState) : "—"),
+      "internet: " + (!relayOK() ? "no disponible aquí" : !Relay.active() ? "—" : Relay.up ? "conectado" : Relay.conn() ? "esperando al otro aparato" : navigator.onLine ? "conectando al servidor" : "sin internet"),
+    ].join(" · ");
+  }
+
   const Link = {
-    pc: null, dc: null, role: null, last: "", statusT: 0, onChange: null, onMsg: null,
-    ok() { return !!this.dc && this.dc.readyState === "open"; },
-    reset() {
-      clearInterval(this.statusT);
+    pc: null, dc: null, role: null, last: "", statusT: 0, onChange: null, onMsg: null, up: false, tries: 0, retryT: 0,
+    dcOpen() { return !!this.dc && this.dc.readyState === "open"; },
+    ok() { return this.up && (this.dcOpen() || Relay.up); },
+    via() { return this.dcOpen() ? "directo" : Relay.up ? "por internet" : ""; },
+    closePC() {
       const dc = this.dc, pc = this.pc; this.dc = this.pc = null;
       try { dc && dc.close(); } catch {} try { pc && pc.close(); } catch {}
     },
-    newPC(role, certificates) {
-      this.reset(); this.role = role; this.last = ""; this.quick = false;
-      const pc = (this.pc = new RTCPeerConnection(certificates ? { iceServers: [], certificates } : { iceServers: [] }));
-      pc.onconnectionstatechange = () => { if (pc === this.pc && ["failed", "closed"].includes(pc.connectionState)) this.lost(); };
+    reset() {
+      clearInterval(this.statusT); clearTimeout(this.retryT);
+      this.closePC(); Relay.stop(); this.up = false; this.quick = false; this.tries = 0;
+    },
+    /** keep: solo cambia la conexión directa (sigue el respaldo por internet). */
+    newPC(role, certificates, { keep = false } = {}) {
+      if (keep) this.closePC(); else this.reset();
+      this.role = role; this.last = "";
+      const cfg = { iceServers: [] }; if (certificates) cfg.certificates = certificates;
+      try { if (localStorage.getItem("atril:solo-internet") === "1") cfg.iceTransportPolicy = "relay"; } catch {} // para probar el respaldo
+      const pc = (this.pc = new RTCPeerConnection(cfg));
+      pc.onconnectionstatechange = () => { if (pc === this.pc && ["failed", "closed"].includes(pc.connectionState)) this.directLost(); };
       return pc;
     },
     bind(dc) {
       this.dc = dc;
-      dc.onopen = () => this.opened();
-      dc.onclose = () => { if (dc === this.dc) this.lost(); };
+      dc.onopen = () => { if (dc === this.dc) this.opened(); };
+      dc.onclose = () => { if (dc === this.dc) this.directLost(); };
       dc.binaryType = "arraybuffer";
       dc.onmessage = (e) => {
         if (typeof e.data !== "string") { if (this.role === "pantalla") BgRecv.chunk(e.data); return; }
         let m; try { m = JSON.parse(e.data); } catch { return; } this.handle(m);
       };
     },
-    send(m) { if (this.ok()) { try { this.dc.send(JSON.stringify(m)); return true; } catch {} } return false; },
+    send(m) {
+      if (this.dcOpen()) { try { this.dc.send(JSON.stringify(m)); return true; } catch {} }
+      return Relay.up ? Relay.send(m) : false;
+    },
+    /** Se abrió el enlace directo. */
     opened() {
-      Cam.stop(); keepAwake(true);
+      clearTimeout(this.retryT); this.tries = 0;
       if (this.role === "pantalla") {
         const fp = this.pc && this.pc.remoteDescription ? fpOf(this.pc.remoteDescription.sdp) : "";
         if (fp) Known.set(fp); // la próxima vez basta con que el teléfono escanee el código del iPad
-        toast("Control conectado");
+      }
+      this.becomeUp();
+    },
+    /** Llegó el primer mensaje del otro aparato por internet. */
+    relayUp() {
+      this.becomeUp();
+      if (this.role === "pantalla" && !this.dcOpen()) this.scheduleRetry(8000);
+    },
+    relayDown() { if (!this.dcOpen()) this.lost(); else { this.onChange && this.onChange(); } },
+    becomeUp() {
+      if (this.up) { this.onChange && this.onChange(); setRemoteBadge(); return; }
+      this.up = true;
+      Cam.stop(); keepAwake(true);
+      if (this.role === "pantalla") {
+        toast(this.dcOpen() ? "Control conectado" : "Control conectado por internet");
         BgMedia.load().then(() => this.pushStatus());
-        this.statusT = setInterval(() => this.pushStatus(), 700); this.pushStatus();
+        clearInterval(this.statusT); this.statusT = setInterval(() => this.pushStatus(), 700); this.pushStatus();
       }
       setTimeout(() => LinkData.send(), 400); // cada uno le pasa al otro lo que tiene
       this.onChange && this.onChange();
       setRemoteBadge();
     },
+    /** Falló o se cerró el enlace directo: si hay respaldo por internet se sigue por ahí. */
+    directLost() {
+      if (Relay.active()) {
+        const wasDirect = !!this.dc && this.up;
+        this.closePC();
+        if (wasDirect && Relay.up) toast("Se cortó el enlace directo: sigue por internet");
+        if (this.role === "pantalla" && Relay.up) this.scheduleRetry(1500);
+        if (this.up && !Relay.up) return this.lost();
+        this.onChange && this.onChange(); setRemoteBadge();
+        return;
+      }
+      this.lost();
+    },
     lost() {
-      const was = !!this.dc; this.reset();
+      const was = this.up; this.reset();
       if (was) toast(this.role === "pantalla" ? "Se desconectó el control" : "Se perdió la conexión con el iPad");
       if (!P.open) keepAwake(false);
       this.onChange && this.onChange();
       setRemoteBadge();
     },
+    /** iPad: vuelve a intentar el enlace directo usando internet para pasar los códigos (hasta 3 veces). */
+    scheduleRetry(ms) {
+      clearTimeout(this.retryT);
+      if (this.role !== "pantalla" || this.tries >= 3) return;
+      this.retryT = setTimeout(() => this.renegotiate(), ms);
+    },
+    async renegotiate() {
+      if (this.dcOpen() || !Relay.up || this.role !== "pantalla") return;
+      this.tries++;
+      const pc = this.newPC("pantalla", null, { keep: true });
+      this.bind(pc.createDataChannel("atril", { ordered: true }));
+      try {
+        await pc.setLocalDescription(await pc.createOffer());
+        await gathered(pc);
+      } catch { return; }
+      if (pc !== this.pc) return;
+      Relay.send({ t: "sdp", type: "offer", sdp: pc.localDescription.sdp });
+      this.retryT = setTimeout(() => { if (pc === this.pc && !this.dcOpen()) this.scheduleRetry(0); }, 15000);
+    },
+    /** Teléfono: el iPad mandó por internet un código nuevo para el enlace directo. */
+    async remoteOffer(m) {
+      try {
+        const cert = await PhoneCert.get();
+        const pc = this.newPC("control", cert ? [cert] : null, { keep: true });
+        pc.ondatachannel = (e) => this.bind(e.channel);
+        await pc.setRemoteDescription({ type: "offer", sdp: String(m.sdp) });
+        await pc.setLocalDescription(await pc.createAnswer());
+        await gathered(pc);
+        if (pc === this.pc) Relay.send({ t: "sdp", type: "answer", sdp: pc.localDescription.sdp });
+      } catch {}
+    },
+    /** iPad: llegó por internet la respuesta del teléfono. */
+    async remoteAnswer(m) {
+      const pc = this.pc;
+      if (pc && pc.signalingState === "have-local-offer") {
+        try { await pc.setRemoteDescription({ type: "answer", sdp: String(m.sdp) }); Cam.stop(); } catch {}
+      } else if (Relay.up) this.scheduleRetry(300); // ya esperaba a otro teléfono: se negocia de nuevo por internet
+    },
+    fromRelay(m) {
+      if (m.t === "hb") return;
+      if (m.t === "sdp") {
+        if (m.type === "offer" && this.role === "control") this.remoteOffer(m);
+        else if (m.type === "answer" && this.role === "pantalla") this.remoteAnswer(m);
+        return;
+      }
+      if (m.t === "bin") { if (this.role === "pantalla" && typeof m.d === "string") BgRecv.chunk(b64urlDecode(m.d), m.i); return; }
+      this.handle(m);
+    },
     handle(m) {
+      if (m.t === "bye") return this.lost();
       if (m.t === "datos") return LinkData.part(m);
       if (this.role === "pantalla") {
         if (m.t === "cmd") remoteCmd(String(m.cmd || "").slice(0, 24), m.nota);
@@ -661,7 +887,8 @@
         fondo: BgMedia.url ? BgMedia.name || "Fondo" : "", dim: BgMedia.dim(),
       };
       const j = JSON.stringify(st);
-      if (j !== this.last && this.send(st)) this.last = j;
+      // también se repite cada 4 s por si un mensaje se perdió
+      if ((j !== this.last || Date.now() - (this.lastT || 0) > 4000) && this.send(st)) { this.last = j; this.lastT = Date.now(); }
     },
   };
   /** Ajustes que el teléfono puede cambiar en el iPad (con límites, por si llega algo raro). */
@@ -688,26 +915,31 @@
   }
   /** El teléfono manda la foto/GIF/video en pedazos; aquí se juntan y se guardan como fondo. */
   const BgRecv = {
-    meta: null, parts: [], got: 0, MAX: 150 * 1024 * 1024,
+    meta: null, parts: [], got: 0, n: 0, MAX: 150 * 1024 * 1024,
     start(m) {
       const size = +m.size || 0, font = m.kind === "fuente", msg = m.kind === "msg";
-      this.parts = []; this.got = 0; this.meta = null;
+      this.parts = []; this.got = 0; this.n = 0; this.meta = null;
       if (font ? !isFontFile(String(m.name || ""), String(m.type || "")) || size <= 0 || size > Fuente.MAX
         : !/^(image|video)\//.test(String(m.type || "")) || size <= 0 || size > this.MAX) {
-        Link.send({ t: "bg-error", kind: m.kind, msg: font ? "Ese archivo no es una fuente o es muy grande" : "Archivo no válido o muy grande (máx. 150 MB)" }); return;
+        this.early = []; Link.send({ t: "bg-error", kind: m.kind, msg: font ? "Ese archivo no es una fuente o es muy grande" : "Archivo no válido o muy grande (máx. 150 MB)" }); return;
       }
       this.meta = { name: String(m.name || "fondo").slice(0, 80), type: String(m.type || ""), size, font,
         fname: String(m.fname || "").slice(0, 60), src: m.src === "google" ? "google" : "file", msg, text: String(m.text || "").slice(0, 300) };
       if (!msg) toast(font ? "Recibiendo fuente del teléfono…" : "Recibiendo fondo del teléfono…");
+      const early = this.early || []; this.early = []; early.forEach(([b, k]) => this.chunk(b, k));
     },
-    chunk(buf) {
-      if (!this.meta) return;
-      this.parts.push(buf); this.got += buf.byteLength;
+    chunk(buf, i) {
+      if (!this.meta) { if (i != null && (this.early = this.early || []).length < 64) this.early.push([buf, i]); return; }
+      if (i == null) i = this.n++;
+      i = Math.floor(+i); if (!(i >= 0) || this.parts[i]) return;
+      this.parts[i] = buf; this.got += buf.byteLength;
       if (this.got > this.meta.size) { this.meta = null; this.parts = []; }
     },
     async end() {
+      // por internet algún pedazo puede llegar un poco después del aviso de fin
+      for (let k = 0; k < 50 && this.meta && this.got < this.meta.size; k++) await new Promise((r) => setTimeout(r, 100));
       const m = this.meta; this.meta = null;
-      if (!m || this.got !== m.size) { this.parts = []; Link.send({ t: "bg-error", msg: "El archivo llegó incompleto, envíalo otra vez" }); return; }
+      if (!m || this.got !== m.size || [...this.parts].some((x) => !x)) { this.parts = []; Link.send({ t: "bg-error", msg: "El archivo llegó incompleto, envíalo otra vez" }); return; }
       const file = new File(this.parts, m.name, { type: m.type }); this.parts = [];
       if (m.msg) { Msg.show(m.text, file); Link.send({ t: "msg-ok" }); return; }
       if (m.font) {
@@ -724,7 +956,7 @@
   };
   /** Teléfono: manda un archivo al iPad por la conexión directa, sin llenar la memoria de envío. */
   async function sendBgFile(file, onProg, extra = null) {
-    const dc = Link.dc;
+    const dc = Link.dc, relay = !Link.dcOpen();
     if (!Link.ok()) throw new Error("Sin conexión con el iPad");
     if (extra && extra.kind === "fuente") {
       if (!isFontFile(file.name, file.type)) throw new Error("Elige un archivo de fuente (.ttf, .otf o .woff)");
@@ -733,14 +965,23 @@
       if (!/^(image|video)\//.test(file.type)) throw new Error("Elige una foto, un GIF o un video");
       if (file.size > BgRecv.MAX) throw new Error("Es muy grande: máximo 150 MB");
     }
+    if (relay && file.size > 25 * 1024 * 1024) throw new Error("Por internet se mandan archivos de hasta 25 MB. Para videos más grandes conecten los dos a la misma red WiFi.");
     Link.send({ t: "bg-start", name: file.name, type: file.type, size: file.size, ...(extra || {}) });
-    const CH = 64 * 1024;
-    for (let off = 0; off < file.size; off += CH) {
-      while (dc.readyState === "open" && dc.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 30));
-      if (Link.dc !== dc || dc.readyState !== "open") throw new Error("Se perdió la conexión con el iPad");
-      dc.send(await file.slice(off, off + CH).arrayBuffer());
+    const CH = relay ? 48 * 1024 : 64 * 1024;
+    for (let off = 0, i = 0; off < file.size; off += CH, i++) {
+      const bytes = await file.slice(off, off + CH).arrayBuffer();
+      if (relay) {
+        if (!Relay.up || Link.dcOpen()) throw new Error("Cambió la conexión con el iPad: envíalo otra vez");
+        await Relay.drain();
+        Relay.send({ t: "bin", i, d: b64big(new Uint8Array(bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "") }, false, false);
+      } else {
+        while (dc.readyState === "open" && dc.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 30));
+        if (Link.dc !== dc || dc.readyState !== "open") throw new Error("Se perdió la conexión con el iPad");
+        dc.send(bytes);
+      }
       onProg(Math.min(1, (off + CH) / file.size));
     }
+    if (relay) await Relay.drain();
     Link.send({ t: "bg-end" });
   }
   // En el teléfono, el gesto "atrás" cerraría la app y cortaría el control. Mientras esté conectado
@@ -764,7 +1005,8 @@
     if (!window.RTCPeerConnection) return toast("Este navegador no permite la conexión directa");
     const d = sheet("Conectar control", `<div class="pair" id="pairBox"></div>`);
     let done = false, run = 0;
-    d.addEventListener("close", () => { run++; Cam.stop(); if (!done && !Link.ok()) Link.reset(); }, { once: true });
+    const diagT = setInterval(() => { const e = $("#pdiag", d); if (e) e.textContent = linkDiag(); }, 1500);
+    d.addEventListener("close", () => { run++; clearInterval(diagT); Cam.stop(); if (!done && !Link.ok()) Link.reset(); }, { once: true });
     Link.onChange = () => { if (Link.ok()) { done = true; d.close(); } };
 
     const start = async (fresh) => {
@@ -779,7 +1021,8 @@
           <div class="qr" id="qr"><div class="empty">Preparando código…</div></div>
           <div class="cam"><video id="cam" playsinline muted></video><span class="cam-msg" id="camMsg">Abriendo cámara…</span></div>
         </div>
-        <p class="pair-state" id="pst">Los dos aparatos deben estar en la misma red WiFi o en el hotspot del teléfono (no necesita datos).</p>
+        <p class="pair-state" id="pst">Con internet en los dos se conecta aunque estén en redes distintas. Sin internet, los dos deben estar en la misma red WiFi o en el hotspot del teléfono.</p>
+        <p class="pair-diag" id="pdiag"></p>
         ${known ? `<div class="row"><button class="btn sm tint" id="other">Usar otro teléfono</button></div>` : ""}
         <details class="pair-manual"><summary>¿No funciona la cámara?</summary>
           <p class="section-f">Copia este código y pásalo al teléfono${known ? "" : ", luego pega aquí el que te dé"}.</p>
@@ -795,7 +1038,10 @@
         try {
           const desc = await unpackSdp(code);
           if (desc.type !== "answer") { pst("Ese es el código del iPad. Muestra el que aparece en el teléfono."); return false; }
-          if (known) { pst("Ese es otro teléfono: toca «Usar otro teléfono»."); return false; }
+          if (known) { // es otro teléfono (o uno con otra versión): se empieza de nuevo sin esperar a ninguno en especial
+            toast("Teléfono nuevo: en el teléfono toca «Empezar de nuevo» y escanea otra vez el código del iPad");
+            start(true); return true;
+          }
           if (!Link.pc || Link.pc.signalingState !== "have-local-offer") { pst("Espera a que aparezca el código del iPad."); return false; }
           pst("Conectando…");
           await Link.pc.setRemoteDescription(desc);
@@ -809,6 +1055,8 @@
       catch (e) { const m = $("#camMsg", d); if (m) m.textContent = e.message || "No se pudo abrir la cámara"; }
       if (my !== run) return;
       const pc = Link.newPC("pantalla");
+      const rkey = Relay.newKey(), ext = rkey ? [RELAY, ...rkey] : [];
+      if (rkey) Relay.start(rkey, "pantalla");
       Link.bind(pc.createDataChannel("atril", { ordered: true }));
       await pc.setLocalDescription(await pc.createOffer());
       await gathered(pc);
@@ -816,14 +1064,14 @@
       let code = null;
       if (known) {
         // el iPad arma solo la respuesta del teléfono conocido (sin direcciones: el teléfono llega solo)
-        code = compactSdp(pc.localDescription, [QUICK, ...fpHint(known.fp)]);
+        code = compactSdp(pc.localDescription, [QUICK, ...fpHint(known.fp), ...ext]);
         if (code) {
           const sdp = pc.localDescription.sdp, ice = derivedIce(sdp);
           try { await pc.setRemoteDescription({ type: "answer", sdp: buildSdp({ setup: "active", ...ice, mid: sdpGet(sdp, "mid"), fp: known.fp, cands: [] }) }); }
           catch { code = null; }
         }
         if (!code) return start(true); // no se pudo: enlace normal con los dos códigos
-      } else code = await packSdp(pc.localDescription);
+      } else code = await packSdp(pc.localDescription, ext);
       $("#qr", d).innerHTML = await qrSvg(code);
       $("#myCode", d).value = code;
       $("#cp", d).onclick = async () => { try { await navigator.clipboard.writeText(code); toast("Copiado"); } catch { $("#myCode", d).select(); } };
@@ -1633,8 +1881,9 @@
     setBar({ title: "Control", left: "back", back: "#/notas" });
     const draw = () => {
       if (Link.ok() && Link.role === "control") return drawPad();
-      if (Link.role === "control" && Link.pc && Link.quick) return drawWait();
-      if (Link.role === "control" && Link.pc && Link.answer) return drawAnswer();
+      const busy = Link.role === "control" && (Link.pc || Relay.active());
+      if (busy && Link.quick) return drawWait();
+      if (busy && Link.answer) return drawAnswer();
       drawScan();
     };
     Link.onChange = () => { if (location.hash.startsWith("#/control")) draw(); };
@@ -1655,7 +1904,8 @@
       el.innerHTML = `
         <div class="ctl">
           <h2 class="ctl-h">Escanea el código del iPad</h2>
-          <p class="section-f">En el iPad: ☰ → <b>Conectar control</b>. Los dos deben estar en la misma red WiFi o en el hotspot de este teléfono (no necesita datos).</p>
+          <p class="section-f">En el iPad: ☰ → <b>Conectar control</b>. Con internet en los dos se conecta aunque estén en redes distintas; sin internet, los dos en la misma red WiFi o en el hotspot de este teléfono.</p>
+          <p class="pair-diag">Atril ${APP_VERSION}</p>
           <div class="cam big"><video id="cam" playsinline muted></video><span class="cam-msg" id="camMsg">Abriendo cámara…</span></div>
           <details class="pair-manual"><summary>¿No funciona la cámara?</summary>
             <textarea class="field-input code" id="theirCode" placeholder="Pega aquí el código del iPad"></textarea>
@@ -1668,10 +1918,10 @@
           const desc = await unpackSdp(code);
           const msg = (t) => { const m = $("#camMsg", el); if (m) m.textContent = t; };
           if (desc.type !== "offer") { msg("Ese es el código del teléfono. Escanea el del iPad."); return false; }
-          const cert = await certP, mark = desc.extra && desc.extra[0] === QUICK ? desc.extra.slice(1, 3) : null;
+          const cert = await certP, ex = readExtra(desc.extra || []);
           // el iPad espera a un teléfono conocido: ¿soy yo?
-          const quick = !!mark;
-          if (quick && !(cert && fpHint(PhoneCert.fp(cert)).every((v, k) => v === mark[k]))) {
+          const quick = !!ex.quick && !!cert && fpHint(PhoneCert.fp(cert)).every((v, k) => v === ex.quick[k]);
+          if (ex.quick && !quick && !ex.key) { // iPad de una versión anterior: no hay otra forma
             msg("Este iPad recuerda otro teléfono. En el iPad toca «Usar otro teléfono».");
             return false;
           }
@@ -1679,6 +1929,7 @@
           msg(quick ? "¡Leído! Conectando…" : "¡Leído! Preparando respuesta…");
           const pc = Link.newPC("control", cert ? [cert] : null);
           pc.ondatachannel = (e) => Link.bind(e.channel);
+          if (ex.key) Relay.start(ex.key, "control"); // respaldo por internet (si hay)
           await pc.setRemoteDescription(desc);
           let ans = await pc.createAnswer();
           if (quick) {
@@ -1692,7 +1943,9 @@
           Cam.stop();
           if (pc !== Link.pc || quick) return true;
           Link.answer = await packSdp(pc.localDescription);
-          draw();
+          // con internet la respuesta llega sola al iPad; sin internet se muestra el código
+          Relay.send({ t: "sdp", type: "answer", sdp: pc.localDescription.sdp }, true);
+          if (!Link.ok()) draw();
           return true;
         } catch (e) { const m = $("#camMsg", el); if (m) m.textContent = "No se pudo leer: " + e.message; return false; }
       };
@@ -1708,15 +1961,16 @@
         <div class="ctl">
           <h2 class="ctl-h">Conectando con el iPad…</h2>
           <p class="pair-state" id="wst">El iPad ya conoce este teléfono: no hace falta mostrarle ningún código.</p>
+          <p class="pair-diag" id="wdiag"></p>
           <div class="row" style="justify-content:center"><button class="btn sm plain" id="again">Empezar de nuevo</button></div>
         </div>`;
-      const pc = Link.pc;
-      $("#again", el).onclick = () => { Link.reset(); Link.quick = false; draw(); };
-      setTimeout(() => {
-        if (Link.pc !== pc || Link.ok() || !location.hash.startsWith("#/control")) return;
-        const w = $("#wst", el);
-        if (w) w.innerHTML = "No se pudo conectar. Revisa que los dos estén en la misma red (WiFi o el hotspot de este teléfono) y toca <b>Empezar de nuevo</b>.";
-      }, 12000);
+      $("#again", el).onclick = () => { Link.reset(); Link.role = null; draw(); };
+      const t0 = Date.now(), tt = setInterval(() => {
+        const w = $("#wst", el), g = $("#wdiag", el);
+        if (!g || Link.ok() || !location.hash.startsWith("#/control")) return clearInterval(tt);
+        g.textContent = linkDiag();
+        if (Date.now() - t0 > 12000 && w) w.innerHTML = "Todavía no se conecta. Sin internet, los dos deben estar en la misma red WiFi o en el hotspot de este teléfono. Toca <b>Empezar de nuevo</b> y escanea otra vez.";
+      }, 1500);
     }
 
     async function drawAnswer() {
@@ -1724,7 +1978,8 @@
         <div class="ctl">
           <h2 class="ctl-h">Muestra este código a la cámara del iPad</h2>
           <div class="qr big" id="qr"></div>
-          <p class="pair-state">Esperando al iPad… <button class="btn sm plain" id="again">Empezar de nuevo</button></p>
+          <p class="pair-state">${Relay.active() ? "Si los dos tienen internet se conecta solo en unos segundos; si no, " : ""}muestra este código a la cámara del iPad. <button class="btn sm plain" id="again">Empezar de nuevo</button></p>
+          <p class="pair-diag" id="adiag"></p>
           <details class="pair-manual"><summary>¿No funciona la cámara del iPad?</summary>
             <textarea class="field-input code" readonly id="myCode"></textarea>
             <div class="row"><button class="btn sm tint" id="cp">Copiar</button></div>
@@ -1733,7 +1988,8 @@
       $("#qr", el).innerHTML = await qrSvg(Link.answer);
       $("#myCode", el).value = Link.answer;
       $("#cp", el).onclick = async () => { try { await navigator.clipboard.writeText(Link.answer); toast("Copiado"); } catch { $("#myCode", el).select(); } };
-      $("#again", el).onclick = () => { Link.answer = null; Link.reset(); draw(); };
+      $("#again", el).onclick = () => { Link.answer = null; Link.reset(); Link.role = null; draw(); };
+      const tt = setInterval(() => { const g = $("#adiag", el); if (!g || Link.ok()) return clearInterval(tt); g.textContent = linkDiag(); }, 1500);
     }
 
     function drawPad() {
@@ -1794,7 +2050,7 @@
       };
       $$("[data-cmd]", el).forEach((b) => (b.onclick = () => send(b.dataset.cmd)));
       $("#nota", el).onchange = (e) => { if (e.target.value) send("open", { nota: e.target.value }); };
-      $("#cut", el).onclick = () => { Link.reset(); Link.role = null; draw(); };
+      $("#cut", el).onclick = () => { Link.send({ t: "bye" }); setTimeout(() => { Link.reset(); Link.role = null; draw(); }, 300); };
       guardBack();
       // ajustes del iPad desde el teléfono (los deslizadores mandan como máximo ~10 cambios por segundo)
       const last = {}, later = {};
@@ -1901,8 +2157,8 @@
   function updatePad() {
     const cst = $("#cst"), sel = $("#nota"); if (!cst || !sel) return;
     const s = ctlState;
-    cst.innerHTML = !s ? `<span class="sync-dot ok">Conectado</span>` :
-      `<span class="sync-dot ok">Conectado</span> · ${s.abierto ? `${s.playing ? "▶" : "❚❚"} <b>${esc(s.abierto)}</b> · vel ${esc(fmtSpeed(s.speed))}` : "Elige un guion"}`;
+    cst.innerHTML = !s ? `<span class="sync-dot ok">Conectado ${esc(Link.via())}</span>` :
+      `<span class="sync-dot ok">Conectado ${esc(Link.via())}</span> · ${s.abierto ? `${s.playing ? "▶" : "❚❚"} <b>${esc(s.abierto)}</b> · vel ${esc(fmtSpeed(s.speed))}` : "Elige un guion"}`;
     const want = (s && s.notas) || [];
     if (sel.options.length - 1 !== want.length || sel.dataset.sig !== String(want.length) + (want[0] || [""])[0]) {
       sel.innerHTML = `<option value="">Elegir…</option>` + want.map(([id, t]) => `<option value="${esc(id)}">${esc(t)}</option>`).join("");
