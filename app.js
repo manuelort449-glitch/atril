@@ -1061,8 +1061,20 @@
   // al tocarla. Genius no da letras por su API, por eso solo se abre su página para copiar.
   const Lyrics = {
     clean(t) {
-      return String(t || "").replace(/\r\n?/g, "\n").split("\n").filter((l) => !/^paroles de la chanson/i.test(l.trim()))
-        .join("\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+      const junk = /^(paroles de la chanson.*|\d*\s*contributors?|you might also like|también te (podría|puede) gustar|translations?|\d*embed|see .* live|get tickets.*)$/i;
+      return String(t || "").replace(/\r\n?/g, "\n").replace(/\d*Embed\s*$/i, "").split("\n")
+        .map((l) => l.replace(/[ \t\u00a0]+$/g, "")).filter((l) => !junk.test(l.trim()))
+        .join("\n").replace(/^.*\bLyrics\s*\n/i, "").replace(/\n{3,}/g, "\n\n").trim();
+    },
+    /** Páginas donde buscar a mano cuando las fuentes automáticas no la tienen. */
+    webs(q) {
+      const e = encodeURIComponent;
+      return [
+        ["Letras.com", "https://www.letras.com/?q=" + e(q)],
+        ["Genius", "https://genius.com/search?q=" + e(q)],
+        ["Musica.com", "https://www.musica.com/letras.asp?t2=" + e(q)],
+        ["Google", "https://www.google.com/search?q=" + e(q + " letra")],
+      ];
     },
     timed(p, ms) { return Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("tardó demasiado")), ms))]); },
     async lrclib(q) {
@@ -1101,14 +1113,37 @@
         <label class="cell"><div class="t"><b>Canción</b></div><input type="text" id="lq" value="${esc(nombre)}" placeholder="Nombre de la canción"></label>
         <label class="cell"><div class="t"><b>Artista</b><span>Opcional, ayuda a encontrarla</span></div><input type="text" id="la" placeholder="ej. Los Ángeles Azules"></label>
       </div>
-      <div class="row" style="margin-top:10px"><button class="btn fill" id="lgo">${ic("search")} Buscar</button><span class="spacer"></span>
-        <a class="btn plain" id="lgen" target="_blank" rel="noopener">Ver en Genius</a></div>
+      <div class="row" style="margin-top:10px"><button class="btn fill" id="lgo">${ic("search")} Buscar</button></div>
       <p class="section-f" id="lst">Busca en LRCLIB y Lyrics.ovh (gratis). Toca un resultado para ver la letra.</p>
-      <div class="group" id="lres"></div>`, { el: "#sheet2" });
+      <div class="group" id="lres"></div>
+      <div class="section-h">¿No está? Búscala en la web</div>
+      <div class="lyr-webs" id="lwebs"></div>
+      <p class="section-f">Abre la página, copia la letra (mantén presionado → Seleccionar → Copiar), regresa a Atril y toca <b>Pegar letra</b>.</p>
+      <div class="row"><button class="btn tint" id="lpst">Pegar letra</button></div>
+      <div id="lman" hidden>
+        <textarea class="editor" id="lpaste" style="min-height:22vh" placeholder="Mantén presionado aquí y toca Pegar"></textarea>
+        <div class="row"><span class="spacer"></span><button class="btn fill sm" id="luse">Usar este texto</button></div>
+      </div>`, { el: "#sheet2" });
     let items = [];
     const q = () => [$("#lq", d).value.trim(), $("#la", d).value.trim()].filter(Boolean).join(" ");
     const st = (t) => ($("#lst", d).textContent = t);
-    const gen = () => ($("#lgen", d).href = "https://genius.com/search?q=" + encodeURIComponent(q() || nombre));
+    const gen = () => ($("#lwebs", d).innerHTML = Lyrics.webs(q() || nombre)
+      .map(([n, u]) => `<a class="btn sm tint" href="${esc(u)}" target="_blank" rel="noopener">${esc(n)}</a>`).join(""));
+    const use = (t) => {
+      t = Lyrics.clean(t);
+      if (t.length < 20) { toast("Eso no parece una letra: copia la letra completa"); return; }
+      if (actual.trim() && !confirm("Esta canción ya tiene letra. ¿Cambiarla por la nueva?")) return;
+      onUse(t); d.close();
+    };
+    $("#lpst", d).onclick = async () => {
+      let t = "";
+      try { t = await navigator.clipboard.readText(); } catch {}
+      if (t && t.trim().length >= 20) return use(t);
+      // si el aparato no deja leer lo copiado, se pega a mano en un recuadro
+      $("#lman", d).hidden = false; $("#lpaste", d).focus();
+      toast(t ? "Lo copiado es muy corto: copia la letra completa" : "Mantén presionado el recuadro y toca Pegar");
+    };
+    $("#luse", d).onclick = () => use($("#lpaste", d).value);
     const run = async () => {
       const text = q();
       gen();
@@ -1117,7 +1152,8 @@
       st("Buscando…"); $("#lres", d).innerHTML = "";
       const r = await Lyrics.search(text);
       items = r.items;
-      if (!items.length) return st(r.errs.length === 2 ? "No se pudo buscar (" + r.errs[0].message + "). Revisa el internet." : "No se encontró. Prueba con el artista o con otra forma del nombre, o usa Ver en Genius.");
+      if (!items.length) return st(r.errs.length === 2 ? "No se pudo buscar (" + r.errs[0].message + "). Revisa el internet."
+        : "No está en las fuentes automáticas. Búscala en la web (abajo): Letras.com tiene mucha música regional.");
       st(`${items.length} resultados. Toca uno para ver la letra.`);
       $("#lres", d).innerHTML = items.map((x, i) => `<button class="cell" data-i="${i}"><div class="t"><b class="wrap">${esc(x.titulo)}</b>
           <span>${esc(x.artista)}${x.album ? " · " + esc(x.album) : ""}</span></div><span class="tag lyr">${x.fuente}</span></button>`).join("");
@@ -1126,12 +1162,8 @@
     $("#lq", d).onkeydown = $("#la", d).onkeydown = (e) => { if (e.key === "Enter") run(); };
     $("#lgo", d).onclick = run;
     $("#lres", d).onclick = async (e) => {
-      const use = e.target.closest("[data-use]");
-      if (use) {
-        const x = items[+use.dataset.use];
-        if (actual.trim() && !confirm("Esta canción ya tiene letra. ¿Cambiarla por la nueva?")) return;
-        onUse(x.letra); d.close(); return;
-      }
+      const useB = e.target.closest("[data-use]");
+      if (useB) { use(items[+useB.dataset.use].letra); return; }
       const b = e.target.closest("[data-i]"); if (!b) return;
       const open = b.nextElementSibling && b.nextElementSibling.classList.contains("lyr-prev");
       $$(".lyr-prev", d).forEach((x) => x.remove());

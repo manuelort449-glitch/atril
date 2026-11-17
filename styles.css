@@ -451,3 +451,5 @@ body.drawer-open .scrim { opacity: 1; pointer-events: auto; }
   #set .cell .t { flex: 1 1 calc(100% - 40px); }
   #set .acts { width: 100%; justify-content: flex-end; }
 }
+.lyr-webs { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 4px 6px; }
+.lyr-webs a { text-decoration: none; }
