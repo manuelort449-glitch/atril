@@ -581,7 +581,11 @@
       this.dc = dc;
       dc.onopen = () => this.opened();
       dc.onclose = () => { if (dc === this.dc) this.lost(); };
-      dc.onmessage = (e) => { let m; try { m = JSON.parse(e.data); } catch { return; } this.handle(m); };
+      dc.binaryType = "arraybuffer";
+      dc.onmessage = (e) => {
+        if (typeof e.data !== "string") { if (this.role === "pantalla") BgRecv.chunk(e.data); return; }
+        let m; try { m = JSON.parse(e.data); } catch { return; } this.handle(m);
+      };
     },
     send(m) { if (this.ok()) { try { this.dc.send(JSON.stringify(m)); return true; } catch {} } return false; },
     opened() {
@@ -590,6 +594,7 @@
         const fp = this.pc && this.pc.remoteDescription ? fpOf(this.pc.remoteDescription.sdp) : "";
         if (fp) Known.set(fp); // la próxima vez basta con que el teléfono escanee el código del iPad
         toast("Control conectado");
+        BgMedia.load().then(() => this.pushStatus());
         this.statusT = setInterval(() => this.pushStatus(), 700); this.pushStatus();
       }
       this.onChange && this.onChange();
@@ -603,8 +608,13 @@
       setRemoteBadge();
     },
     handle(m) {
-      if (this.role === "pantalla" && m.t === "cmd") remoteCmd(String(m.cmd || "").slice(0, 24), m.nota);
-      else if (this.onMsg) this.onMsg(m);
+      if (this.role === "pantalla") {
+        if (m.t === "cmd") remoteCmd(String(m.cmd || "").slice(0, 24), m.nota);
+        else if (m.t === "set") remoteSet(String(m.k || ""), m.v);
+        else if (m.t === "bg-start") BgRecv.start(m);
+        else if (m.t === "bg-end") BgRecv.end();
+        else if (m.t === "bg-clear") BgMedia.clear().then(() => { toast("Fondo quitado"); this.pushStatus(); });
+      } else if (this.onMsg) this.onMsg(m);
     },
     /** El iPad le cuenta al teléfono qué guiones hay y qué está pasando, para mostrarlo en el control. */
     pushStatus() {
@@ -613,11 +623,79 @@
         t: "estado", abierto: P.open ? ($("#pTitle").textContent || "Guion") : "", playing: !!P.playing,
         speed: state.ajustes.speed, font: state.ajustes.font,
         notas: ordered(alive(state.notas)).map((x) => [x.id, x.titulo]), nota: n ? n.id : "",
+        aj: { margin: state.ajustes.margin, mirror: !!state.ajustes.mirror, guide: !!state.ajustes.guide, loop: !!state.ajustes.loop,
+          fg: state.ajustes.fg || "#ffffff", bg: state.ajustes.bg || "#000000" },
+        fondo: BgMedia.url ? BgMedia.name || "Fondo" : "", dim: BgMedia.dim(),
       };
       const j = JSON.stringify(st);
       if (j !== this.last && this.send(st)) this.last = j;
     },
   };
+  /** Ajustes que el teléfono puede cambiar en el iPad (con límites, por si llega algo raro). */
+  const REMOTE_SET = {
+    margin: (v) => Math.min(25, Math.max(0, Math.round(+v))),
+    mirror: (v) => !!v, guide: (v) => !!v, loop: (v) => !!v,
+    fg: (v) => (/^#[0-9a-f]{6}$/i.test(v) ? v : null), bg: (v) => (/^#[0-9a-f]{6}$/i.test(v) ? v : null),
+  };
+  function remoteSet(k, v) {
+    if (k === "dim") { const d = Math.round(+v); if (d >= 0 && d <= 90) { BgMedia.setDim(d); Link.pushStatus(); } return; }
+    const f = REMOTE_SET[k]; if (!f) return;
+    const val = f(v); if (val === null || Number.isNaN(val)) return;
+    state.ajustes[k] = val; save({ sync: false });
+    if (P.open) applySettings();
+    if (document.body.classList.contains("drawer-open")) drawDrawer();
+    Link.pushStatus();
+  }
+  /** El teléfono manda la foto/GIF/video en pedazos; aquí se juntan y se guardan como fondo. */
+  const BgRecv = {
+    meta: null, parts: [], got: 0, MAX: 150 * 1024 * 1024,
+    start(m) {
+      const size = +m.size || 0;
+      this.parts = []; this.got = 0; this.meta = null;
+      if (!/^(image|video)\//.test(String(m.type || "")) || size <= 0 || size > this.MAX) { Link.send({ t: "bg-error", msg: "Archivo no válido o muy grande (máx. 150 MB)" }); return; }
+      this.meta = { name: String(m.name || "fondo").slice(0, 80), type: String(m.type), size };
+      toast("Recibiendo fondo del teléfono…");
+    },
+    chunk(buf) {
+      if (!this.meta) return;
+      this.parts.push(buf); this.got += buf.byteLength;
+      if (this.got > this.meta.size) { this.meta = null; this.parts = []; }
+    },
+    async end() {
+      const m = this.meta; this.meta = null;
+      if (!m || this.got !== m.size) { this.parts = []; Link.send({ t: "bg-error", msg: "El archivo llegó incompleto, envíalo otra vez" }); return; }
+      const file = new File(this.parts, m.name, { type: m.type }); this.parts = [];
+      try { await BgMedia.choose(file); toast("Fondo nuevo listo"); Link.send({ t: "bg-ok" }); Link.pushStatus(); }
+      catch (e) { Link.send({ t: "bg-error", msg: e.message || "No se pudo guardar el fondo" }); }
+    },
+  };
+  /** Teléfono: manda un archivo al iPad por la conexión directa, sin llenar la memoria de envío. */
+  async function sendBgFile(file, onProg) {
+    const dc = Link.dc;
+    if (!Link.ok()) throw new Error("Sin conexión con el iPad");
+    if (!/^(image|video)\//.test(file.type)) throw new Error("Elige una foto, un GIF o un video");
+    if (file.size > BgRecv.MAX) throw new Error("Es muy grande: máximo 150 MB");
+    Link.send({ t: "bg-start", name: file.name, type: file.type, size: file.size });
+    const CH = 64 * 1024;
+    for (let off = 0; off < file.size; off += CH) {
+      while (dc.readyState === "open" && dc.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 30));
+      if (Link.dc !== dc || dc.readyState !== "open") throw new Error("Se perdió la conexión con el iPad");
+      dc.send(await file.slice(off, off + CH).arrayBuffer());
+      onProg(Math.min(1, (off + CH) / file.size));
+    }
+    Link.send({ t: "bg-end" });
+  }
+  // En el teléfono, el gesto "atrás" cerraría la app y cortaría el control. Mientras esté conectado
+  // en la pantalla del control, se detiene y se avisa cómo salir.
+  let backGuard = false;
+  function guardBack() { if (!backGuard) { backGuard = true; history.pushState({ atrilGuard: 1 }, "", location.href); } }
+  window.addEventListener("popstate", () => {
+    if (backGuard && Link.ok() && Link.role === "control" && location.hash.startsWith("#/control")) {
+      history.pushState({ atrilGuard: 1 }, "", location.href);
+      toast("Sigues conectado. Para salir del control toca Desconectar");
+    } else backGuard = false;
+  });
+
   function setRemoteBadge() {
     const b = $("#pRemote"); if (b) b.classList.toggle("on", Link.ok() && Link.role === "pantalla");
   }
@@ -1472,7 +1550,13 @@
       drawScan();
     };
     Link.onChange = () => { if (location.hash.startsWith("#/control")) draw(); };
-    Link.onMsg = (m) => { if (m.t === "estado") { ctlState = m; if (location.hash.startsWith("#/control")) updatePad(); } };
+    Link.onMsg = (m) => {
+      if (m.t === "estado") { ctlState = m; if (location.hash.startsWith("#/control")) updatePad(); }
+      else if (m.t === "bg-ok" || m.t === "bg-error") {
+        toast(m.t === "bg-ok" ? "Fondo enviado al iPad ✓" : String(m.msg || "No se pudo enviar el fondo"));
+        const pr = $("#cBgProg"); if (pr) pr.textContent = m.t === "bg-ok" ? "Listo, ya está en el iPad" : "No se pudo enviar";
+      }
+    };
 
     function drawScan() {
       el.innerHTML = `
@@ -1581,6 +1665,22 @@
           <div class="r3"><button class="rbtn" data-cmd="speed:4">Lenta</button><button class="rbtn" data-cmd="speed:6">Normal</button><button class="rbtn" data-cmd="speed:9">Rápida</button></div>
           <div class="r2"><button class="rbtn" data-cmd="smaller">A − Letra</button><button class="rbtn" data-cmd="bigger">A + Letra</button></div>
           <div class="r2"><button class="rbtn" data-cmd="top">⤒ Inicio</button><button class="rbtn" data-cmd="exit">✕ Cerrar guion</button></div>
+          <details class="ctl-more" id="cMore"><summary>Pantalla y fondo del iPad</summary>
+            <div class="group" style="margin:8px 0 0">
+              <div class="cell slider-cell"><div class="top"><b>Márgenes</b><span id="cv-margin"></span></div><input type="range" min="0" max="25" step="1" data-set="margin" aria-label="Márgenes"></div>
+              <label class="cell"><div class="t"><b>Modo espejo</b></div><input type="checkbox" class="switch" data-set="mirror"></label>
+              <label class="cell"><div class="t"><b>Marcador de línea</b></div><input type="checkbox" class="switch" data-set="guide"></label>
+              <label class="cell"><div class="t"><b>Guion en bucle</b></div><input type="checkbox" class="switch" data-set="loop"></label>
+              <label class="cell"><div class="t"><b>Color de letra</b></div><input type="color" data-set="fg" aria-label="Color de letra"></label>
+              <label class="cell"><div class="t"><b>Color de fondo</b></div><input type="color" data-set="bg" aria-label="Color de fondo"></label>
+            </div>
+            <div class="group" style="margin:12px 0 0">
+              <div class="cell"><div class="t"><b id="cBgName">Sin foto ni video de fondo</b><span id="cBgProg">Elige uno aquí: se manda al iPad y queda guardado ahí</span></div>
+                <label class="btn sm tint">Elegir<input type="file" id="cBgFile" accept="image/*,video/*" hidden></label>
+                <button class="btn sm plain danger" id="cBgDel" hidden>Quitar</button></div>
+              <div class="cell slider-cell" id="cDimRow" hidden><div class="top"><b>Oscurecer el fondo</b><span id="cv-dim"></span></div><input type="range" min="0" max="90" step="5" data-set="dim" aria-label="Oscurecer el fondo"></div>
+            </div>
+          </details>
           <button class="btn plain danger" id="cut" style="margin:6px auto 0">Desconectar</button>
         </div>`;
       const send = (cmd, extra) => {
@@ -1590,6 +1690,29 @@
       $$("[data-cmd]", el).forEach((b) => (b.onclick = () => send(b.dataset.cmd)));
       $("#nota", el).onchange = (e) => { if (e.target.value) send("open", { nota: e.target.value }); };
       $("#cut", el).onclick = () => { Link.reset(); Link.role = null; draw(); };
+      guardBack();
+      // ajustes del iPad desde el teléfono (los deslizadores mandan como máximo ~10 cambios por segundo)
+      const last = {}, later = {};
+      $$("[data-set]", el).forEach((inp) => {
+        const k = inp.dataset.set;
+        const val = () => (inp.type === "checkbox" ? inp.checked : inp.type === "range" ? +inp.value : inp.value);
+        const go = () => { last[k] = Date.now(); if (!Link.send({ t: "set", k, v: val() })) toast("Sin conexión con el iPad"); };
+        inp.addEventListener(inp.type === "checkbox" ? "change" : "input", () => {
+          inp.dataset.touched = Date.now();
+          const o = $("#cv-" + k, el); if (o) o.textContent = inp.value + (k === "dim" ? " %" : "");
+          clearTimeout(later[k]);
+          if (Date.now() - (last[k] || 0) > 100) go(); else later[k] = setTimeout(go, 120);
+        });
+      });
+      $("#cBgFile", el).onchange = async (e) => {
+        const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return;
+        const pr = $("#cBgProg", el);
+        try {
+          await sendBgFile(f, (x) => { if (pr) pr.textContent = `Enviando al iPad… ${Math.round(x * 100)} %`; });
+          if (pr) pr.textContent = "Guardando en el iPad…";
+        } catch (err) { toast(err.message); if (pr) pr.textContent = "No se pudo enviar"; }
+      };
+      $("#cBgDel", el).onclick = () => { if (!Link.send({ t: "bg-clear" })) toast("Sin conexión con el iPad"); };
       // ▲ ▼: una línea por toque; mantenido, sigue línea por línea
       $$("[data-line]", el).forEach((b) => {
         let t1 = 0, t2 = 0;
@@ -1631,6 +1754,15 @@
     }
     if (s) sel.value = s.nota || "";
     const pb = $("#cPlay"); if (pb && s) pb.innerHTML = `${ic(s.playing ? "pause" : "play")} ${s.playing ? "Pausar" : "Iniciar"}`;
+    // ajustes de pantalla tal como están en el iPad (sin pisar lo que estás moviendo en ese momento)
+    if (s && s.aj) $$("[data-set]").forEach((inp) => {
+      const k = inp.dataset.set, v = k === "dim" ? s.dim : s.aj[k];
+      if (v == null || document.activeElement === inp || Date.now() - (+inp.dataset.touched || 0) < 1500) return;
+      if (inp.type === "checkbox") inp.checked = !!v; else inp.value = v;
+      const o = $("#cv-" + k); if (o) o.textContent = v + (k === "dim" ? " %" : "");
+    });
+    const bn = $("#cBgName");
+    if (bn && s) { bn.textContent = s.fondo || "Sin foto ni video de fondo"; $("#cBgDel").hidden = !s.fondo; $("#cDimRow").hidden = !s.fondo; }
   }
 
   // ---------- Ajustes ----------

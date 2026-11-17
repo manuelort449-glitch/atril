@@ -466,3 +466,8 @@ body.drawer-open .scrim { opacity: 1; pointer-events: auto; }
 .dr-bg-btns .btn { background: rgba(255, 255, 255, .92); color: #2f4a3a; font-weight: 700; cursor: pointer; }
 .dr-bg-btns .btn.danger { background: rgba(0, 0, 0, .22); color: #fff; }
 .dr-row > span.dr-bg-btns { flex: none; }
+.ctl-more { margin-top: 14px; }
+.ctl-more > summary { cursor: pointer; font-weight: 700; font-size: 17px; padding: 12px 4px; color: var(--accent-strong); list-style: none; }
+.ctl-more > summary::before { content: "▸ "; }
+.ctl-more[open] > summary::before { content: "▾ "; }
+.ctl-more input[type="color"] { width: 46px; height: 34px; border: 0; background: none; padding: 0; flex: none; }
