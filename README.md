@@ -107,6 +107,12 @@ Al terminar y probar los cambios, sube el número de `VERSION` en `sw.js` y úne
 - Desplazamiento automático con cuenta regresiva, línea guía, barra de progreso y pantalla siempre encendida.
 - **Velocidades:** botones − / + (de 0.5 en 0.5), menú rápido al tocar el número
   (Muy lenta 2 · Lenta 4 · Normal 6 · Rápida 9 · Muy rápida 13 · Máxima 20) y **cada nota recuerda su velocidad**.
+- **Barra deslizante de velocidad:** en el menú de velocidad (toca el número) y, en pantallas anchas como el iPad,
+  también en la barra de abajo del prompter; se puede mover mientras corre el texto.
+- **Tipografías:** del aparato (funcionan sin internet), de **Google Fonts** (gratis; se bajan una vez y quedan
+  guardadas, o escribe el nombre de cualquier otra) o un **archivo propio** `.ttf/.otf` (por ejemplo bajado de DaFont).
+- **Efectos de letra:** Neón, Neón parpadeante, Brillo que late, Arcoíris, Solo contorno, Sombra 3D y Fuego
+  (el neón usa el *Color de fuente*).
 - **Cambios de velocidad dentro de la nota:** escribe una línea `[vel 8]` y al llegar a la línea guía cambia sola.
 - Saltar a la canción anterior / siguiente, tamaño de letra, espejo horizontal y vertical, mayúsculas.
 - Las líneas `-Canción TONO/Canción TONO` se muestran como encabezados con el tono resaltado;
@@ -115,6 +121,13 @@ Al terminar y probar los cambios, sube el número de `VERSION` en `sw.js` y úne
 **Control remoto**
 - Pedal o teclado Bluetooth: `Espacio` iniciar/pausar · `↑ ↓` velocidad · `← →` o `Re Pág / Av Pág` canción ·
   `+ −` letra · `M` espejo · `Inicio` volver arriba · `Esc` salir.
+- **Teléfono como control (QR, sin internet):** iniciar/pausar, panel para deslizar, canciones, velocidad con barra,
+  letra, y en *Pantalla y fondo del iPad*: márgenes, espejo, colores, tipografía, efecto y fondo.
+- **MENSAJE:** en el control escribe un mensaje (y si quieres agrega una foto o un video con 📎) y toca el sobre.
+  En el iPad llega un sobre que dice MENSAJE, se abre, sale la foto/video y el texto corre de lado a lado;
+  luego vuelve solo a la letra (si iba corriendo, sigue donde iba). Tocar la pantalla lo salta.
+- **Intercambio de datos por el enlace:** al conectarse, el iPad y el teléfono se pasan notas, canciones y letras
+  (sin internet) y siguen pasándose los cambios mientras estén conectados. Con internet, además, Dropbox.
 - Celular como control: abre `…/remote.html` (con `server.py`). Puede abrir notas en el iPad, iniciar/pausar,
   cambiar canción, velocidad (incluye Lenta / Normal / Rápida) y tamaño de letra.
 

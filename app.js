@@ -58,6 +58,8 @@
     menu: '<path d="M4 7h16M4 12h16M4 17h16"/>',
     handle: '<path d="M5 8h14M5 12h14M5 16h14"/>',
     qr: '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2v2M20 14v6h-4M14 18v2"/>',
+    clip: '<path d="m20 11.5-8 8a5 5 0 0 1-7-7l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7L9.7 17.2a1.6 1.6 0 0 1-2.3-2.3L15 7.3"/>',
+    mail: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="m3.5 7 8.5 6 8.5-6"/>',
     gauge: '<path d="M4.5 17a8.5 8.5 0 1 1 15 0"/><path d="m12 13 4-4"/><circle cx="12" cy="13" r="1.3"/>',
   };
   const ic = (n, cls = "") => `<svg class="i ${cls}" viewBox="0 0 24 24" aria-hidden="true">${(ICONS[n] || "").replace(/class="f"/g, 'fill="currentColor" stroke="none"')}</svg>`;
@@ -152,7 +154,7 @@
   // ================= 2. datos =================
   const STORE = "atril:v2";
   const DEVICE = (() => { try { let d = localStorage.getItem("atril:device"); if (!d) { d = uid(); localStorage.setItem("atril:device", d); } return d; } catch { return uid(); } })();
-  const DEFAULT_SETTINGS = { font: 56, speed: 6, lineHeight: 1.35, margin: 8, mirror: false, mirrorV: false, guide: true, guidePos: 35, countdown: 3, upper: false, loop: false, fg: "#ffffff", bg: "#000000" };
+  const DEFAULT_SETTINGS = { font: 56, speed: 6, lineHeight: 1.35, margin: 8, mirror: false, mirrorV: false, guide: true, guidePos: 35, countdown: 3, upper: false, loop: false, fg: "#ffffff", bg: "#000000", fuente: "sistema", efecto: "ninguno" };
   const DEFAULT_RITMOS = ["Cumbia", "Banda romántica", "Ranchera", "Corrido", "Norteña", "Huapango", "Quebradita", "Tropical", "Balada", "Rock / Pop", "Zapateado"];
 
   function seed() {
@@ -181,10 +183,37 @@
     return seed();
   }
   let state = load();
-  function save({ sync = true } = {}) {
+  /** Notas, canciones y letras también viajan por el enlace directo iPad ⇄ teléfono (sirve sin internet).
+   *  Van en pedazos porque cada mensaje del canal tiene un tamaño máximo. */
+  const LinkData = {
+    PART: 60000, got: null, t: 0,
+    send() {
+      if (!Link.ok()) return;
+      const j = JSON.stringify(shared()), n = Math.max(1, Math.ceil(j.length / this.PART)), id = Date.now().toString(36);
+      for (let i = 0; i < n; i++) Link.send({ t: "datos", id, i, n, s: j.slice(i * this.PART, (i + 1) * this.PART) });
+    },
+    later() { clearTimeout(this.t); if (Link.ok()) this.t = setTimeout(() => this.send(), 2000); },
+    part(m) {
+      const n = +m.n, i = +m.i;
+      if (!(n >= 1 && n <= 400 && i >= 0 && i < n) || typeof m.s !== "string") return;
+      if (!this.got || this.got.id !== m.id) this.got = { id: m.id, n, parts: [], c: 0 };
+      const g = this.got;
+      if (g.parts[i] == null) { g.parts[i] = m.s; g.c++; }
+      if (g.c < g.n) return;
+      this.got = null;
+      let data; try { data = JSON.parse(g.parts.join("")); } catch { return; }
+      const { changed } = mergeIn(data);
+      if (!changed) return;
+      save({ link: false }); // no se reenvía al otro aparato: ya lo tiene
+      toast(`${changed} cambio${changed === 1 ? "" : "s"} recibido${changed === 1 ? "" : "s"} del ${Link.role === "pantalla" ? "teléfono" : "iPad"}`);
+      refreshView();
+    },
+  };
+  function save({ sync = true, link = true } = {}) {
     try { localStorage.setItem(STORE, JSON.stringify(state)); }
     catch { toast("No se pudo guardar en este navegador"); }
     if (sync) Sync.schedule();
+    if (sync && link) LinkData.later();
   }
   save({ sync: false });
   // Pide al navegador guardar los datos de forma permanente (que Safari no los borre por falta de uso).
@@ -597,6 +626,7 @@
         BgMedia.load().then(() => this.pushStatus());
         this.statusT = setInterval(() => this.pushStatus(), 700); this.pushStatus();
       }
+      setTimeout(() => LinkData.send(), 400); // cada uno le pasa al otro lo que tiene
       this.onChange && this.onChange();
       setRemoteBadge();
     },
@@ -608,12 +638,14 @@
       setRemoteBadge();
     },
     handle(m) {
+      if (m.t === "datos") return LinkData.part(m);
       if (this.role === "pantalla") {
         if (m.t === "cmd") remoteCmd(String(m.cmd || "").slice(0, 24), m.nota);
         else if (m.t === "set") remoteSet(String(m.k || ""), m.v);
         else if (m.t === "bg-start") BgRecv.start(m);
         else if (m.t === "bg-end") BgRecv.end();
         else if (m.t === "bg-clear") BgMedia.clear().then(() => { toast("Fondo quitado"); this.pushStatus(); });
+        else if (m.t === "msg") { Msg.show(m.text); this.send({ t: "msg-ok" }); }
       } else if (this.onMsg) this.onMsg(m);
     },
     /** El iPad le cuenta al teléfono qué guiones hay y qué está pasando, para mostrarlo en el control. */
@@ -624,7 +656,8 @@
         speed: state.ajustes.speed, font: state.ajustes.font,
         notas: ordered(alive(state.notas)).map((x) => [x.id, x.titulo]), nota: n ? n.id : "",
         aj: { margin: state.ajustes.margin, mirror: !!state.ajustes.mirror, guide: !!state.ajustes.guide, loop: !!state.ajustes.loop,
-          fg: state.ajustes.fg || "#ffffff", bg: state.ajustes.bg || "#000000" },
+          fg: state.ajustes.fg || "#ffffff", bg: state.ajustes.bg || "#000000", efecto: state.ajustes.efecto || "ninguno" },
+        fuente: fontValue(), fuenteN: Fuente.name,
         fondo: BgMedia.url ? BgMedia.name || "Fondo" : "", dim: BgMedia.dim(),
       };
       const j = JSON.stringify(st);
@@ -636,8 +669,15 @@
     margin: (v) => Math.min(25, Math.max(0, Math.round(+v))),
     mirror: (v) => !!v, guide: (v) => !!v, loop: (v) => !!v,
     fg: (v) => (/^#[0-9a-f]{6}$/i.test(v) ? v : null), bg: (v) => (/^#[0-9a-f]{6}$/i.test(v) ? v : null),
+    fuente: (v) => (v === "web" || DEV_FONTS.some((f) => f[0] === v) ? v : null),
+    efecto: (v) => (FX.some((f) => f[0] === v) ? v : null),
   };
   function remoteSet(k, v) {
+    if (k === "fuente-g") { // el teléfono no pudo bajarla: que la baje el iPad
+      Fuente.google(String(v || "").slice(0, 60)).then(() => { state.ajustes.fuente = "web"; save({ sync: false }); if (P.open) applySettings(); toast("Fuente lista: " + Fuente.name); Link.pushStatus(); })
+        .catch(() => Link.send({ t: "bg-error", kind: "fuente", msg: "Ni el teléfono ni el iPad pudieron bajar la fuente: hace falta internet en alguno" }));
+      return;
+    }
     if (k === "dim") { const d = Math.round(+v); if (d >= 0 && d <= 90) { BgMedia.setDim(d); Link.pushStatus(); } return; }
     const f = REMOTE_SET[k]; if (!f) return;
     const val = f(v); if (val === null || Number.isNaN(val)) return;
@@ -650,11 +690,15 @@
   const BgRecv = {
     meta: null, parts: [], got: 0, MAX: 150 * 1024 * 1024,
     start(m) {
-      const size = +m.size || 0;
+      const size = +m.size || 0, font = m.kind === "fuente", msg = m.kind === "msg";
       this.parts = []; this.got = 0; this.meta = null;
-      if (!/^(image|video)\//.test(String(m.type || "")) || size <= 0 || size > this.MAX) { Link.send({ t: "bg-error", msg: "Archivo no válido o muy grande (máx. 150 MB)" }); return; }
-      this.meta = { name: String(m.name || "fondo").slice(0, 80), type: String(m.type), size };
-      toast("Recibiendo fondo del teléfono…");
+      if (font ? !isFontFile(String(m.name || ""), String(m.type || "")) || size <= 0 || size > Fuente.MAX
+        : !/^(image|video)\//.test(String(m.type || "")) || size <= 0 || size > this.MAX) {
+        Link.send({ t: "bg-error", kind: m.kind, msg: font ? "Ese archivo no es una fuente o es muy grande" : "Archivo no válido o muy grande (máx. 150 MB)" }); return;
+      }
+      this.meta = { name: String(m.name || "fondo").slice(0, 80), type: String(m.type || ""), size, font,
+        fname: String(m.fname || "").slice(0, 60), src: m.src === "google" ? "google" : "file", msg, text: String(m.text || "").slice(0, 300) };
+      if (!msg) toast(font ? "Recibiendo fuente del teléfono…" : "Recibiendo fondo del teléfono…");
     },
     chunk(buf) {
       if (!this.meta) return;
@@ -665,17 +709,31 @@
       const m = this.meta; this.meta = null;
       if (!m || this.got !== m.size) { this.parts = []; Link.send({ t: "bg-error", msg: "El archivo llegó incompleto, envíalo otra vez" }); return; }
       const file = new File(this.parts, m.name, { type: m.type }); this.parts = [];
+      if (m.msg) { Msg.show(m.text, file); Link.send({ t: "msg-ok" }); return; }
+      if (m.font) {
+        try {
+          await Fuente.choose(file, m.src, m.fname || undefined);
+          state.ajustes.fuente = "web"; save({ sync: false }); if (P.open) applySettings();
+          toast("Fuente nueva: " + Fuente.name); Link.send({ t: "bg-ok", kind: "fuente" }); Link.pushStatus();
+        } catch (e) { Link.send({ t: "bg-error", kind: "fuente", msg: e.message || "No se pudo usar la fuente" }); }
+        return;
+      }
       try { await BgMedia.choose(file); toast("Fondo nuevo listo"); Link.send({ t: "bg-ok" }); Link.pushStatus(); }
       catch (e) { Link.send({ t: "bg-error", msg: e.message || "No se pudo guardar el fondo" }); }
     },
   };
   /** Teléfono: manda un archivo al iPad por la conexión directa, sin llenar la memoria de envío. */
-  async function sendBgFile(file, onProg) {
+  async function sendBgFile(file, onProg, extra = null) {
     const dc = Link.dc;
     if (!Link.ok()) throw new Error("Sin conexión con el iPad");
-    if (!/^(image|video)\//.test(file.type)) throw new Error("Elige una foto, un GIF o un video");
-    if (file.size > BgRecv.MAX) throw new Error("Es muy grande: máximo 150 MB");
-    Link.send({ t: "bg-start", name: file.name, type: file.type, size: file.size });
+    if (extra && extra.kind === "fuente") {
+      if (!isFontFile(file.name, file.type)) throw new Error("Elige un archivo de fuente (.ttf, .otf o .woff)");
+      if (file.size > Fuente.MAX) throw new Error("La fuente es muy grande (máx. 10 MB)");
+    } else {
+      if (!/^(image|video)\//.test(file.type)) throw new Error("Elige una foto, un GIF o un video");
+      if (file.size > BgRecv.MAX) throw new Error("Es muy grande: máximo 150 MB");
+    }
+    Link.send({ t: "bg-start", name: file.name, type: file.type, size: file.size, ...(extra || {}) });
     const CH = 64 * 1024;
     for (let off = 0; off < file.size; off += CH) {
       while (dc.readyState === "open" && dc.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 30));
@@ -917,6 +975,11 @@
         ${sw("loop", "Guion en bucle")}
         ${col("fg", "Color de fuente")}
         ${col("bg", "Color de fondo")}
+        <label class="dr-row"><span>Tipografía<small id="drFontN">${a.fuente === "web" && Fuente.name ? esc(Fuente.name) : "Las de Google Fonts se bajan una vez y quedan guardadas"}</small></span>
+          <select class="dr-select" id="drFont" aria-label="Tipografía">${fontOptions()}</select></label>
+        <div class="dr-row bgm"><span>Fuente propia<small>Un archivo .ttf u .otf, por ejemplo bajado de DaFont</small></span>
+          <span class="dr-bg-btns"><label class="btn sm tint">Elegir<input type="file" id="drFontFile" accept=".ttf,.otf,.woff,.woff2,font/*" hidden></label></span></div>
+        <label class="dr-row"><span>Efecto de letra</span><select class="dr-select" id="drFx" aria-label="Efecto de letra">${fxOptions()}</select></label>
         <div class="dr-row bgm"><span>Foto, GIF o video de fondo<small>${BgMedia.url ? esc(BgMedia.name || "Elegido") : "Se ve detrás del texto"}</small></span>
           <span class="dr-bg-btns"><label class="btn sm tint">${BgMedia.url ? "Cambiar" : "Elegir"}<input type="file" id="bgFile" accept="image/*,video/*" hidden></label>
           ${BgMedia.url ? `<button class="btn sm plain danger" id="bgDel">Quitar</button>` : ""}</span></div>
@@ -926,6 +989,31 @@
       </div>`;
     const changed = () => { save({ sync: false }); if (P.open) applySettings(); };
     if (!BgMedia.loaded) BgMedia.load().then(() => { if (document.body.classList.contains("drawer-open") && BgMedia.url) drawDrawer(); });
+    const df = $("#drFont", dr);
+    const setFontSel = () => {
+      const v = fontValue();
+      if (![...df.options].some((o) => o.value === v)) df.insertAdjacentHTML("beforeend", `<option value="${esc(v)}">${esc(Fuente.name || v)}</option>`);
+      df.value = v;
+    };
+    setFontSel();
+    if (!Fuente.loaded) Fuente.load().then(() => document.body.classList.contains("drawer-open") && setFontSel());
+    df.onchange = async () => {
+      let v = df.value;
+      if (v === "g:?") { const n = askFontName(); if (!n) return setFontSel(); v = "g:" + n; }
+      if (v.startsWith("g:")) {
+        toast("Bajando la fuente " + v.slice(2) + "…");
+        try { await Fuente.google(v.slice(2)); a.fuente = "web"; toast("Fuente lista: " + Fuente.name); }
+        catch { toast("No se pudo bajar esa fuente. Revisa el internet o el nombre"); return setFontSel(); }
+      } else a.fuente = v === "file" ? "web" : v;
+      changed(); Link.pushStatus(); drawDrawer();
+    };
+    $("#drFontFile", dr).onchange = async (e) => {
+      const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return;
+      try { await Fuente.choose(f); a.fuente = "web"; changed(); toast("Fuente lista: " + Fuente.name); Link.pushStatus(); drawDrawer(); }
+      catch (err) { toast(err.message); }
+    };
+    $("#drFx", dr).value = a.efecto || "ninguno";
+    $("#drFx", dr).onchange = (e) => { a.efecto = e.target.value; changed(); Link.pushStatus(); };
     const bf = $("#bgFile", dr);
     bf.onchange = async () => {
       const f = bf.files && bf.files[0]; if (!f) return;
@@ -1552,10 +1640,15 @@
     Link.onChange = () => { if (location.hash.startsWith("#/control")) draw(); };
     Link.onMsg = (m) => {
       if (m.t === "estado") { ctlState = m; if (location.hash.startsWith("#/control")) updatePad(); }
+      else if (m.kind === "fuente" && (m.t === "bg-ok" || m.t === "bg-error")) {
+        toast(m.t === "bg-ok" ? "Fuente puesta en el iPad ✓" : String(m.msg || "No se pudo usar la fuente"));
+        const pr = $("#cFontProg"); if (pr) pr.textContent = m.t === "bg-ok" ? "Listo, ya está en el iPad" : "No se pudo";
+      }
       else if (m.t === "bg-ok" || m.t === "bg-error") {
         toast(m.t === "bg-ok" ? "Fondo enviado al iPad ✓" : String(m.msg || "No se pudo enviar el fondo"));
         const pr = $("#cBgProg"); if (pr) pr.textContent = m.t === "bg-ok" ? "Listo, ya está en el iPad" : "No se pudo enviar";
       }
+      else if (m.t === "msg-ok") toast("El mensaje ya está en la pantalla del iPad ✓");
     };
 
     function drawScan() {
@@ -1662,9 +1755,17 @@
             <button class="rbtn tk right" data-cmd="next" aria-label="Canción siguiente">▶<small>canción</small></button>
           </div>
           <div class="r2"><button class="rbtn" data-cmd="slower">− Velocidad</button><button class="rbtn" data-cmd="faster">+ Velocidad</button></div>
-          <div class="r3"><button class="rbtn" data-cmd="speed:4">Lenta</button><button class="rbtn" data-cmd="speed:6">Normal</button><button class="rbtn" data-cmd="speed:9">Rápida</button></div>
+          <div class="group" style="margin:0"><div class="cell slider-cell"><div class="top"><b>Velocidad</b><span id="cv-speed"></span></div>
+            <input type="range" min="0.5" max="30" step="0.5" id="cSpeed" aria-label="Velocidad"></div></div>
           <div class="r2"><button class="rbtn" data-cmd="smaller">A − Letra</button><button class="rbtn" data-cmd="bigger">A + Letra</button></div>
           <div class="r2"><button class="rbtn" data-cmd="top">⤒ Inicio</button><button class="rbtn" data-cmd="exit">✕ Cerrar guion</button></div>
+          <div class="msg-card">
+            <div class="msg-h"><b>MENSAJE</b><span class="spacer"></span>
+              <label class="msg-att" aria-label="Agregar foto o video">${ic("clip")}<input type="file" id="cMsgFile" accept="image/*,video/*" hidden></label>
+              <button class="msg-send" id="cMsgSend" aria-label="Enviar mensaje a la pantalla">${ic("mail")}</button></div>
+            <textarea id="cMsg" maxlength="300" rows="2" placeholder="Escribe un mensaje para que salga en la pantalla del iPad"></textarea>
+            <div class="msg-chip" id="cMsgChip" hidden><span id="cMsgChipT"></span><button id="cMsgChipX" aria-label="Quitar archivo">✕</button></div>
+          </div>
           <details class="ctl-more" id="cMore"><summary>Pantalla y fondo del iPad</summary>
             <div class="group" style="margin:8px 0 0">
               <div class="cell slider-cell"><div class="top"><b>Márgenes</b><span id="cv-margin"></span></div><input type="range" min="0" max="25" step="1" data-set="margin" aria-label="Márgenes"></div>
@@ -1673,6 +1774,10 @@
               <label class="cell"><div class="t"><b>Guion en bucle</b></div><input type="checkbox" class="switch" data-set="loop"></label>
               <label class="cell"><div class="t"><b>Color de letra</b></div><input type="color" data-set="fg" aria-label="Color de letra"></label>
               <label class="cell"><div class="t"><b>Color de fondo</b></div><input type="color" data-set="bg" aria-label="Color de fondo"></label>
+              <label class="cell"><div class="t"><b>Tipografía</b><span id="cFontN"></span></div><select id="cFont" aria-label="Tipografía">${fontOptions()}</select></label>
+              <div class="cell"><div class="t"><b>Fuente propia</b><span id="cFontProg">Un archivo .ttf u .otf (por ejemplo de DaFont)</span></div>
+                <label class="btn sm tint">Elegir<input type="file" id="cFontFile" accept=".ttf,.otf,.woff,.woff2,font/*" hidden></label></div>
+              <label class="cell"><div class="t"><b>Efecto de letra</b></div><select data-set="efecto" aria-label="Efecto de letra">${fxOptions()}</select></label>
             </div>
             <div class="group" style="margin:12px 0 0">
               <div class="cell"><div class="t"><b id="cBgName">Sin foto ni video de fondo</b><span id="cBgProg">Elige uno aquí: se manda al iPad y queda guardado ahí</span></div>
@@ -1685,7 +1790,7 @@
         </div>`;
       const send = (cmd, extra) => {
         if (!Link.send({ t: "cmd", cmd, ...extra })) return toast("Sin conexión con el iPad");
-        if (navigator.vibrate && !/^drag:/.test(cmd)) navigator.vibrate(12);
+        if (navigator.vibrate && !/^(drag|speed):/.test(cmd)) navigator.vibrate(12);
       };
       $$("[data-cmd]", el).forEach((b) => (b.onclick = () => send(b.dataset.cmd)));
       $("#nota", el).onchange = (e) => { if (e.target.value) send("open", { nota: e.target.value }); };
@@ -1713,6 +1818,57 @@
         } catch (err) { toast(err.message); if (pr) pr.textContent = "No se pudo enviar"; }
       };
       $("#cBgDel", el).onclick = () => { if (!Link.send({ t: "bg-clear" })) toast("Sin conexión con el iPad"); };
+      // tipografía: el teléfono baja la fuente de Google Fonts y se la manda al iPad (así el iPad no necesita internet)
+      const cf = $("#cFont", el), cfp = $("#cFontProg", el);
+      const sendFont = async (file, extra) => {
+        try { await sendBgFile(file, (x) => (cfp.textContent = `Enviando fuente… ${Math.round(x * 100)} %`), { kind: "fuente", ...extra }); }
+        catch (err) { toast(err.message); cfp.textContent = "No se pudo enviar"; }
+      };
+      cf.onchange = async () => {
+        let v = cf.value; cf.dataset.touched = Date.now();
+        if (v === "g:?") { const n = askFontName(); if (!n) { updatePad(); return; } v = "g:" + n; }
+        if (!v.startsWith("g:")) { if (!Link.send({ t: "set", k: "fuente", v: v === "file" ? "web" : v })) toast("Sin conexión con el iPad"); return; }
+        const fam = v.slice(2); cfp.textContent = "Bajando " + fam + "…";
+        let file = null; try { file = await Fuente.googleFile(fam); } catch {}
+        if (file) return sendFont(file, { fname: fam, src: "google" });
+        cfp.textContent = "Este teléfono no pudo bajarla: se la pido al iPad";
+        Link.send({ t: "set", k: "fuente-g", v: fam });
+      };
+      $("#cFontFile", el).onchange = (e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; if (f) sendFont(f, {}); };
+      // velocidad con la barra (como máximo ~10 cambios por segundo)
+      const sp = $("#cSpeed", el); let spLast = 0, spT = 0;
+      const spGo = () => { spLast = Date.now(); send("speed:" + sp.value); };
+      sp.addEventListener("input", () => {
+        sp.dataset.touched = Date.now(); $("#cv-speed", el).textContent = fmtSpeed(+sp.value);
+        clearTimeout(spT); if (Date.now() - spLast > 100) spGo(); else spT = setTimeout(spGo, 120);
+      });
+      // MENSAJE: sale en el iPad con un sobre y el texto corriendo de lado a lado
+      let msgFile = null, msgBusy = false;
+      const chip = (f) => {
+        msgFile = f; $("#cMsgChip", el).hidden = !f;
+        if (f) $("#cMsgChipT", el).textContent = (/^video\//.test(f.type) ? "🎬 " : "🖼 ") + f.name;
+      };
+      $("#cMsgFile", el).onchange = (e) => {
+        const f = e.target.files && e.target.files[0]; e.target.value = ""; if (!f) return;
+        if (!/^(image|video)\//.test(f.type)) return toast("Elige una foto, un GIF o un video");
+        if (f.size > BgRecv.MAX) return toast("Es muy grande: máximo 150 MB");
+        chip(f);
+      };
+      $("#cMsgChipX", el).onclick = () => chip(null);
+      $("#cMsgSend", el).onclick = async () => {
+        const ta = $("#cMsg", el), text = ta.value.trim().slice(0, 300), b = $("#cMsgSend", el);
+        if (msgBusy) return;
+        if (!text && !msgFile) { ta.focus(); return toast("Escribe el mensaje o agrega una foto o video"); }
+        if (msgFile) {
+          msgBusy = true; const f = msgFile, t = $("#cMsgChipT", el);
+          try { await sendBgFile(f, (x) => (t.textContent = `Enviando… ${Math.round(x * 100)} %`), { kind: "msg", text }); }
+          catch (err) { msgBusy = false; t.textContent = f.name; return toast(err.message); }
+          msgBusy = false; chip(null);
+        } else if (!Link.send({ t: "msg", text })) return toast("Sin conexión con el iPad");
+        b.classList.remove("sent"); void b.offsetWidth; b.classList.add("sent");
+        if (navigator.vibrate) navigator.vibrate(20);
+        ta.value = ""; toast("Mensaje enviado ✉");
+      };
       // ▲ ▼: una línea por toque; mantenido, sigue línea por línea
       $$("[data-line]", el).forEach((b) => {
         let t1 = 0, t2 = 0;
@@ -1753,6 +1909,15 @@
       sel.dataset.sig = String(want.length) + (want[0] || [""])[0];
     }
     if (s) sel.value = s.nota || "";
+    const cf = $("#cFont");
+    if (cf && s && s.fuente && document.activeElement !== cf && Date.now() - (+cf.dataset.touched || 0) > 1500) {
+      if (![...cf.options].some((o) => o.value === s.fuente)) cf.insertAdjacentHTML("beforeend", `<option value="${esc(s.fuente)}">${esc(s.fuenteN || s.fuente.slice(2))}</option>`);
+      cf.value = s.fuente; $("#cFontN").textContent = s.fuente === "file" ? s.fuenteN || "" : "";
+    }
+    const csp = $("#cSpeed");
+    if (csp && s && s.speed != null && document.activeElement !== csp && Date.now() - (+csp.dataset.touched || 0) > 1500) {
+      csp.value = s.speed; $("#cv-speed").textContent = fmtSpeed(s.speed);
+    }
     const pb = $("#cPlay"); if (pb && s) pb.innerHTML = `${ic(s.playing ? "pause" : "play")} ${s.playing ? "Pausar" : "Iniciar"}`;
     // ajustes de pantalla tal como están en el iPad (sin pisar lo que estás moviendo en ese momento)
     if (s && s.aj) $$("[data-set]").forEach((inp) => {
@@ -1920,9 +2085,14 @@
     let m = $("#pSpeedMenu");
     if (m) { m.remove(); return; }
     m = document.createElement("div"); m.id = "pSpeedMenu"; m.className = "p-menu";
-    m.innerHTML = `<div class="p-menu-h">Velocidad</div>` + SPEED_PRESETS.map(([n, v]) =>
+    m.innerHTML = `<div class="p-menu-h">Velocidad</div>
+      <div class="p-menu-r"><input type="range" min="0.5" max="30" step="0.5" value="${state.ajustes.speed}" id="pMenuR" aria-label="Velocidad"><b id="pMenuV">${fmtSpeed(state.ajustes.speed)}</b></div>` + SPEED_PRESETS.map(([n, v]) =>
       `<button data-sp="${v}" class="${state.ajustes.speed === v ? "on" : ""}"><span>${n}</span><b>${v}</b></button>`).join("") +
       `<div class="p-menu-f">Tip: escribe <b>[vel 8]</b> en una línea de la nota para cambiar la velocidad al llegar ahí.</div>`;
+    $("#pMenuR", m).addEventListener("input", (e) => {
+      setSpeed(+e.target.value); $("#pMenuV").textContent = fmtSpeed(state.ajustes.speed);
+      $$("[data-sp]", m).forEach((b) => b.classList.toggle("on", +b.dataset.sp === state.ajustes.speed));
+    });
     m.onclick = (e) => { e.stopPropagation(); const b = e.target.closest("[data-sp]"); if (b) { setSpeed(+b.dataset.sp); m.remove(); toast("Velocidad " + b.dataset.sp); } };
     $("#prompter").appendChild(m); showUI();
   }
@@ -1940,6 +2110,87 @@
 
   // ---- Fondo del teleprompter: foto, GIF o video. Se guarda solo en este aparato (IndexedDB),
   // no se sincroniza porque puede pesar mucho. "Oscurecer" pone una capa negra encima para leer bien.
+  // ---- tipografías ----
+  // Las del aparato funcionan siempre; las de Google Fonts (gratis, licencia abierta) se bajan una vez
+  // y se guardan en el iPad; y se puede usar cualquier archivo de fuente propio (por ejemplo de DaFont).
+  const DEV_FONTS = [
+    ["sistema", "Normal (del sistema)", "var(--font)"],
+    ["redonda", "Redondeada", 'ui-rounded, "SF Pro Rounded", "Arial Rounded MT Bold", var(--font)'],
+    ["serif", "Clásica con serifa", 'ui-serif, "New York", Georgia, "Times New Roman", serif'],
+    ["maquina", "Máquina de escribir", '"American Typewriter", "Courier New", monospace'],
+    ["futura", "Futura", 'Futura, "Century Gothic", "Trebuchet MS", sans-serif'],
+    ["angosta", "Angosta", '"Avenir Next Condensed", "Arial Narrow", "Roboto Condensed", sans-serif'],
+    ["marcador", "Marcador", '"Marker Felt", "Chalkboard SE", "Comic Sans MS", cursive'],
+  ];
+  const WEB_FONTS = ["Tilt Neon", "Neonderthaw", "Monoton", "Bungee", "Righteous", "Orbitron", "Audiowide", "Bebas Neue", "Anton", "Oswald",
+    "Montserrat", "Poppins", "Playfair Display", "Lobster", "Pacifico", "Permanent Marker", "Kaushan Script", "Caveat", "Great Vibes", "Press Start 2P"];
+  const FX = [["ninguno", "Sin efecto"], ["neon", "Neón"], ["neon-parpadeo", "Neón parpadeante"], ["latido", "Brillo que late"],
+    ["arcoiris", "Arcoíris"], ["contorno", "Solo contorno"], ["sombra3d", "Sombra 3D"], ["fuego", "Fuego"]];
+  const isFontFile = (name, type) => /\.(ttf|otf|woff2?)$/i.test(name || "") || /^(font\/|application\/(x-)?font)/i.test(type || "");
+  const fontOptions = () =>
+    `<optgroup label="Del aparato (sin internet)">${DEV_FONTS.map(([v, n]) => `<option value="${v}">${n}</option>`).join("")}</optgroup>` +
+    `<optgroup label="Google Fonts (se bajan una vez)">${WEB_FONTS.map((n) => `<option value="g:${esc(n)}">${esc(n)}</option>`).join("")}` +
+    `<option value="g:?">Otra de Google Fonts…</option></optgroup>`;
+  const fxOptions = () => FX.map(([v, n]) => `<option value="${v}">${n}</option>`).join("");
+  const askFontName = () => {
+    const n = (prompt("Nombre de la fuente tal como aparece en fonts.google.com (por ejemplo: Rubik Glitch)") || "").trim();
+    return n.replace(/[^\p{L}\p{N} ]/gu, "").slice(0, 60);
+  };
+  /** Lo que se muestra elegido en las listas. */
+  function fontValue() {
+    const a = state.ajustes;
+    if (a.fuente !== "web") return DEV_FONTS.some((f) => f[0] === a.fuente) ? a.fuente : "sistema";
+    return Fuente.src === "google" ? "g:" + Fuente.name : "file";
+  }
+  function fontStack() {
+    const a = state.ajustes;
+    if (a.fuente === "web") return '"AtrilFuente", var(--font)';
+    return (DEV_FONTS.find((f) => f[0] === a.fuente) || DEV_FONTS[0])[2];
+  }
+  const Fuente = {
+    name: "", src: "", face: null, loaded: false, MAX: 10 * 1024 * 1024,
+    async load() {
+      if (this.loaded) return;
+      this.loaded = true;
+      try { const r = await BgMedia.io("readonly", (st) => st.get("fuente")); if (r && r.blob) await this.apply(r.blob, r.name, r.src); } catch {}
+    },
+    async apply(blob, name, src) {
+      const face = new FontFace("AtrilFuente", await blob.arrayBuffer(), { weight: "100 900", style: "normal" });
+      await face.load();
+      if (this.face) document.fonts.delete(this.face);
+      document.fonts.add(face); this.face = face; this.name = name || "Fuente propia"; this.src = src || "file";
+    },
+    /** Guarda y activa un archivo de fuente (.ttf, .otf, .woff, .woff2). */
+    async choose(file, src = "file", name) {
+      if (!isFontFile(file.name, file.type)) throw new Error("Elige un archivo de fuente (.ttf, .otf o .woff)");
+      if (file.size > this.MAX) throw new Error("La fuente es muy grande (máx. 10 MB)");
+      name = name || file.name.replace(/\.(ttf|otf|woff2?)$/i, "").replace(/[_-]+/g, " ").trim();
+      try { await this.apply(file, name, src); } catch { throw new Error("Ese archivo de fuente no se pudo abrir"); }
+      this.loaded = true;
+      try { await BgMedia.io("readwrite", (st) => st.put({ blob: file, name, src }, "fuente")); } catch {}
+    },
+    /** Baja de Google Fonts el archivo (letras latinas, la más gruesa hasta 700) sin guardarlo. */
+    async googleFile(family) {
+      const q = encodeURIComponent(family).replace(/%20/g, "+"), base = "https://fonts.googleapis.com/css2?display=swap&family=";
+      let r = await fetch(base + q + ":wght@400;700");
+      if (!r.ok) r = await fetch(base + q);
+      if (!r.ok) throw new Error("No existe esa fuente");
+      const css = await r.text(), faces = [];
+      css.replace(/\/\*\s*([\w-]+)\s*\*\/\s*@font-face\s*{([^}]*)}/g, (_, sub, body) => {
+        const u = /url\((https:\/\/fonts\.gstatic\.com\/[^)]+)\)/.exec(body), w = /font-weight:\s*(\d+)/.exec(body);
+        if (u) faces.push({ sub, url: u[1], w: w ? +w[1] : 400 });
+      });
+      if (!faces.length) css.replace(/url\((https:\/\/fonts\.gstatic\.com\/[^)]+)\)/g, (_, u) => faces.push({ sub: "latin", url: u, w: 400 }));
+      const pick = faces.filter((f) => f.sub === "latin").sort((x, y) => y.w - x.w)[0] || faces[0];
+      if (!pick) throw new Error("No se encontró el archivo");
+      const f = await fetch(pick.url); if (!f.ok) throw new Error("descarga " + f.status);
+      const ext = (/\.(woff2|woff|ttf|otf)(\?|$)/.exec(pick.url) || [, "woff2"])[1];
+      return new File([await f.blob()], family + "." + ext, { type: "font/" + ext });
+    },
+    async google(family) { await this.choose(await this.googleFile(family), "google", family); },
+  };
+  setTimeout(() => Fuente.load().then(() => { if (P.open) applySettings(); }), 0);
+
   const BgMedia = {
     url: "", kind: "", name: "", loaded: false, K: "atril:fondo-oscuro",
     db() {
@@ -2032,7 +2283,11 @@
     pr.classList.toggle("mirror", !!a.mirror);
     pr.classList.toggle("mirror-v", !!a.mirrorV);
     pr.classList.toggle("no-guide", !a.guide);
+    document.documentElement.style.setProperty("--p-family", fontStack());
+    pr.dataset.fx = a.efecto || "ninguno";
     $("#pSpeed").textContent = fmtSpeed(a.speed); $("#pFont").textContent = a.font;
+    const r = $("#pSpeedR"); if (r && +r.value !== a.speed) r.value = a.speed;
+    const mr = $("#pMenuR"); if (mr && document.activeElement !== mr) { mr.value = a.speed; $("#pMenuV").textContent = fmtSpeed(a.speed); }
     $("#pMirror").classList.toggle("on", !!a.mirror);
     // posiciones de los marcadores [vel N] (se miden con el prompter visible y la letra ya aplicada)
     if (P.open) P.marks = $$("#pText .spd").map((el) => ({ y: el.offsetTop, v: +el.dataset.v }));
@@ -2059,7 +2314,7 @@
     $("#pProgress").style.width = (max > 0 ? (sc.scrollTop / max) * 100 : 0) + "%";
   }
   let countT = 0;
-  function play() {
+  function play({ count = true } = {}) {
     if (P.playing || countT) return;
     const box = $("#pCount");
     const go = () => {
@@ -2069,7 +2324,7 @@
       clearInterval(P.tick); P.tick = setInterval(() => { if (performance.now() - P.last > 80) step(); }, 50);
       hideUISoon();
     };
-    let left = state.ajustes.countdown; if (!left) return go();
+    let left = count ? state.ajustes.countdown : 0; if (!left) return go();
     box.hidden = false; box.textContent = left;
     countT = setInterval(() => { left--; if (left <= 0) { clearInterval(countT); go(); } else box.textContent = left; }, 1000);
   }
@@ -2147,6 +2402,85 @@
     }
     save({ sync: false }); applySettings(); showUI();
   }
+  /** MENSAJE desde el teléfono: llega un sobre, se abre, el texto corre de lado a lado y se vuelve a la letra. */
+  const Msg = {
+    q: [], busy: false, resume: false, cur: null,
+    show(text, file = null) {
+      text = String(text || "").replace(/\s+/g, " ").trim().slice(0, 300);
+      if ((!text && !file) || this.q.length >= 6) return;
+      this.q.push({ text, file }); if (!this.busy) this.next();
+    },
+    async next() {
+      const it = this.q.shift();
+      if (it == null) {
+        this.busy = false;
+        if (this.resume && P.open) play({ count: false });
+        this.resume = false; return;
+      }
+      this.busy = true;
+      if (P.open && (P.playing || countT)) { pause(); this.resume = true; }
+      const a = state.ajustes, o = document.createElement("div");
+      o.className = "msg-ov" + (a.mirror ? " mirror" : "") + (a.mirrorV ? " mirror-v" : "");
+      o.dataset.fx = a.efecto || "ninguno"; o.style.setProperty("--p-fg", a.fg || "#ffffff");
+      o.innerHTML = `<div class="msg-env"><svg viewBox="0 0 120 84" aria-hidden="true">
+          <rect x="3" y="3" width="114" height="78" rx="9" class="e-body"/><path d="M6 78 48 42M114 78 72 42" class="e-line"/>
+          <path d="M5 7 60 49 115 7" class="e-flap"/></svg><b>MENSAJE</b></div>
+        <div class="msg-media"></div><div class="msg-run"><span></span></div>`;
+      const text = it.text; let url = "";
+      o.querySelector(".msg-run span").textContent = text;
+      document.body.appendChild(o);
+      // si el aparato frena las animaciones, un reloj de respaldo hace que el mensaje siga igual
+      const anim = (el, kf, opt) => {
+        const x = (this.cur = el.animate(kf, { fill: "forwards", ...opt }));
+        return Promise.race([x.finished.catch(() => {}), new Promise((r) => setTimeout(() => { try { x.finish(); } catch {} r(); }, opt.duration + 150))]);
+      };
+      o.onclick = () => {
+        this.skip = true; this.stopMedia && this.stopMedia();
+        o.getAnimations({ subtree: true }).forEach((x) => { try { x.finish(); } catch {} });
+      };
+      this.skip = false;
+      try {
+        const env = o.querySelector(".msg-env");
+        await anim(o, [{ opacity: 0 }, { opacity: 1 }], { duration: 200 });
+        await anim(env, [
+          { transform: "translate(-60vw, 30vh) scale(.35) rotate(-18deg)", opacity: 0 },
+          { transform: "translate(4vw, -2vh) scale(1.08) rotate(4deg)", opacity: 1, offset: .7 },
+          { transform: "none", opacity: 1 }], { duration: 650, easing: "cubic-bezier(.2,.8,.2,1)" });
+        env.classList.add("open");
+        if (!this.skip) await anim(env, [{ transform: "none" }, { transform: "scale(1.04)" }, { transform: "none" }], { duration: 800 });
+        await anim(env, [{ transform: "none", opacity: 1 }, { transform: "translateY(-24vh) scale(.5)", opacity: 0 }], { duration: 380, easing: "ease-in" });
+        const run = o.querySelector(".msg-run"), sp = run.firstElementChild;
+        // foto (7 s) o video (hasta que termine, máx. 90 s), con el texto corriendo abajo
+        let mediaDone = Promise.resolve();
+        if (it.file && !this.skip) {
+          url = URL.createObjectURL(it.file);
+          const box = o.querySelector(".msg-media");
+          if (/^video\//.test(it.file.type)) {
+            const v = Object.assign(document.createElement("video"), { src: url, muted: true, playsInline: true, autoplay: true });
+            v.setAttribute("playsinline", ""); v.setAttribute("muted", "");
+            box.appendChild(v); v.play().catch(() => {});
+            mediaDone = new Promise((r) => { v.onended = r; v.onerror = r; setTimeout(r, 90000); this.stopMedia = r; });
+          } else {
+            const img = new Image(); img.src = url; img.alt = ""; box.appendChild(img);
+            mediaDone = new Promise((r) => { setTimeout(r, 7000); this.stopMedia = r; });
+          }
+          box.classList.add("on");
+          await anim(box, [{ opacity: 0, transform: "scale(.9)" }, { opacity: 1, transform: "none" }], { duration: 420, easing: "cubic-bezier(.2,.8,.2,1)" });
+          run.classList.add("bottom");
+        }
+        let textDone = Promise.resolve();
+        if (text && !this.skip) {
+          run.classList.add("on");
+          const W = o.clientWidth, w = sp.offsetWidth, pxs = Math.max(320, W / 3.2);
+          textDone = anim(sp, [{ transform: `translateX(${W}px)` }, { transform: `translateX(${-w}px)` }],
+            { duration: Math.max(3500, ((W + w) / pxs) * 1000), easing: "linear" });
+        }
+        await Promise.all([mediaDone, textDone]);
+        await anim(o, [{ opacity: 1 }, { opacity: 0 }], { duration: 350 });
+      } finally { o.remove(); this.cur = null; this.stopMedia = null; if (url) URL.revokeObjectURL(url); }
+      this.next();
+    },
+  };
   function showUI() { $("#prompter").classList.remove("hide-ui"); hideUISoon(); }
   function hideUISoon() { clearTimeout(P.hideT); if (P.playing) P.hideT = setTimeout(() => $("#prompter").classList.add("hide-ui"), 2500); }
   // Pantalla siempre encendida. Wake Lock solo existe en https; abierta desde la PC
@@ -2183,6 +2517,9 @@
     }
   });
   $("#pScroll").addEventListener("scroll", () => { if (!P.playing) progress(); }, { passive: true });
+  // barra de velocidad del prompter: se mueve mientras corre el texto
+  $("#pSpeedR").addEventListener("input", (e) => { setSpeed(+e.target.value); showUI(); });
+  ["pointerdown", "click"].forEach((ev) => $("#pSpeedR").addEventListener(ev, (e) => { e.stopPropagation(); showUI(); }));
   $("#prompter").addEventListener("mousemove", showUI, { passive: true });
 
   document.addEventListener("keydown", (e) => {
