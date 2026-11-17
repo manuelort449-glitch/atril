@@ -81,6 +81,8 @@ iPad con el archivo de respaldo: ☰ → Más ajustes y respaldo → **Recibir a
 **Control desde el teléfono sin PC:** los dos en la misma red (el hotspot del teléfono sin datos sirve).
 iPad: ☰ → **Conectar control** · teléfono: ☰ → **Usar como control** → escanea el QR del iPad →
 muestra el QR del teléfono a la cámara del iPad. Quedan conectados directo (WebRTC), sin servidor.
+Después de la primera vez el iPad **recuerda el teléfono**: basta con que el teléfono escanee el código
+del iPad (el teléfono guarda un certificado fijo y el iPad su huella). Para otro teléfono: **Usar otro teléfono**.
 
 ### Hacer cambios sin romper lo publicado (ramas)
 

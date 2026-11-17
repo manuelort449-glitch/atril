@@ -383,7 +383,7 @@
   // huella del certificado y las direcciones del aparato. El resto de la descripción es igual
   // en todos los aparatos y se vuelve a armar del otro lado (expandSdp).
   const SETUPS = ["actpass", "active", "passive"];
-  function compactSdp(desc) {
+  function compactSdp(desc, extra = []) {
     const sdp = desc.sdp;
     const get = (k) => { const m = sdp.match(new RegExp("^a=" + k + ":(.*)$", "m")); return m ? m[1].trim() : ""; };
     const ufrag = get("ice-ufrag"), pwd = get("ice-pwd"), mid = get("mid"), setup = SETUPS.indexOf(get("setup"));
@@ -407,7 +407,7 @@
     if (!cands.length) return null;
     const str = (s) => [s.length, ...[...s].map((c) => c.charCodeAt(0))];
     const bytes = [desc.type === "offer" ? 1 : 2, setup, ...str(ufrag), ...str(pwd), ...str(mid),
-      ...fp[1].split(":").map((h) => parseInt(h, 16)), cands.length, ...cands.flat()];
+      ...fp[1].split(":").map((h) => parseInt(h, 16)), cands.length, ...cands.flat(), ...extra];
     return QR_PREFIX2 + b64url(Uint8Array.from(bytes));
   }
   function expandSdp(b) {
@@ -427,11 +427,14 @@
       cands.push(`a=candidate:${k + 1} 1 udp ${2122260223 - k} ${ip} ${(pb[0] << 8) | pb[1]} typ host generation 0`);
     }
     if (!setup) throw new Error("código dañado");
-    const sdp = ["v=0", `o=- ${Date.now()} 2 IN IP4 127.0.0.1`, "s=-", "t=0 0", `a=group:BUNDLE ${mid}`, "a=msid-semantic: WMS",
+    return { type, sdp: buildSdp({ setup, ufrag, pwd, mid, fp, cands }), extra: [...b.slice(i)] };
+  }
+  /** Arma una descripción de conexión completa (solo canal de datos) a partir de sus partes. */
+  function buildSdp({ setup, ufrag, pwd, mid, fp, cands }) {
+    return ["v=0", `o=- ${Date.now()} 2 IN IP4 127.0.0.1`, "s=-", "t=0 0", `a=group:BUNDLE ${mid}`, "a=msid-semantic: WMS",
       "m=application 9 UDP/DTLS/SCTP webrtc-datachannel", "c=IN IP4 0.0.0.0", ...cands,
       `a=ice-ufrag:${ufrag}`, `a=ice-pwd:${pwd}`, "a=ice-options:trickle", `a=fingerprint:sha-256 ${fp}`,
       `a=setup:${setup}`, `a=mid:${mid}`, "a=sctp-port:5000", "a=max-message-size:262144"].join("\r\n") + "\r\n";
-    return { type, sdp };
   }
 
   async function packSdp(desc) {
@@ -462,6 +465,47 @@
     pc.addEventListener("icegatheringstatechange", () => { if (pc.iceGatheringState === "complete") { clearTimeout(t); res(); } });
   });
 
+  // ---- Teléfono recordado: después del primer enlace basta con escanear el código del iPad ----
+  // El teléfono usa siempre el mismo certificado (guardado en el aparato) y el iPad recuerda su
+  // huella. Con eso el iPad arma solo la respuesta del teléfono, y el teléfono ya no tiene que
+  // mostrar su código. El usuario y la clave de conexión del teléfono se calculan igual en los dos
+  // lados a partir de los del iPad (derivedIce); la seguridad la da la huella del certificado.
+  const QUICK = 9; // marca en el código del iPad: "espero al teléfono que ya conozco"
+  const sdpGet = (sdp, k) => { const m = sdp.match(new RegExp("^a=" + k + ":(.*)$", "m")); return m ? m[1].trim() : ""; };
+  const fpOf = (sdp) => { const m = sdpGet(sdp, "fingerprint").match(/^sha-256 (\S+)$/i); return m ? m[1].toUpperCase() : ""; };
+  const fpHint = (fp) => fp.split(":").slice(0, 2).map((h) => parseInt(h, 16));
+  const flip = (s) => [...s].reverse().join("");
+  const derivedIce = (sdp) => ({ ufrag: ("q" + flip(sdpGet(sdp, "ice-ufrag"))).slice(0, 64), pwd: (flip(sdpGet(sdp, "ice-pwd")) + "qq").slice(0, 64) });
+  const Known = {
+    K: "atril:telefono",
+    get() { try { const k = JSON.parse(localStorage.getItem(this.K) || "null"); return k && k.fp ? k : null; } catch { return null; } },
+    set(fp) { try { localStorage.setItem(this.K, JSON.stringify({ fp, t: now() })); } catch {} },
+  };
+  const PhoneCert = {
+    async get() {
+      if (!window.indexedDB || !window.RTCPeerConnection || !RTCPeerConnection.generateCertificate) return null;
+      try {
+        const db = await new Promise((ok, no) => {
+          const r = indexedDB.open("atril-rtc", 1);
+          r.onupgradeneeded = () => r.result.createObjectStore("c");
+          r.onsuccess = () => ok(r.result); r.onerror = () => no(r.error);
+        });
+        const io = (mode, fn) => new Promise((ok, no) => {
+          const tx = db.transaction("c", mode), q = fn(tx.objectStore("c"));
+          tx.oncomplete = () => ok(q.result); tx.onerror = () => no(tx.error);
+        });
+        let cert = await io("readonly", (st) => st.get("cert"));
+        // dura un año; unos días antes de vencer se hace uno nuevo (y hay que enlazar otra vez con los dos códigos)
+        if (!(cert instanceof RTCCertificate) || cert.expires - Date.now() < 20 * 864e5) {
+          cert = await RTCPeerConnection.generateCertificate({ name: "ECDSA", namedCurve: "P-256", expires: 365 * 864e5 });
+          await io("readwrite", (st) => st.put(cert, "cert"));
+        }
+        return cert;
+      } catch { return null; }
+    },
+    fp(cert) { const f = cert && cert.getFingerprints().find((x) => x.algorithm === "sha-256"); return f ? f.value.toUpperCase() : ""; },
+  };
+
   /** Cámara + lector de QR. Usa el lector del sistema si existe (Android) y si no jsQR,
    *  incluido en la app para funcionar sin internet. onCode devuelve true si el código sirvió;
    *  si no, la cámara sigue buscando. */
@@ -478,7 +522,7 @@
       if (!det) await useJsQR();
       let stream;
       try {
-        stream = this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        stream = this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } }, audio: false });
       } catch (e) {
         throw new Error(e.name === "NotAllowedError" ? "Permite el uso de la cámara para leer el código"
           : e.name === "NotFoundError" ? "No se encontró una cámara" : "No se pudo abrir la cámara");
@@ -486,16 +530,19 @@
       video.srcObject = stream; video.setAttribute("playsinline", ""); video.muted = true;
       await video.play().catch(() => {});
       const cv = document.createElement("canvas"), cx = cv.getContext("2d", { willReadFrequently: true });
-      let last = "", lastT = 0;
+      let last = "", lastT = 0, crop = false;
       const read = async () => {
         if (det) {
           try { const r = await det.detect(video); const hit = r.find((x) => isAtrilCode(x.rawValue)); return hit ? hit.rawValue : ""; }
           catch { det = null; await useJsQR().catch(() => {}); return ""; }
         }
         if (!window.jsQR) return "";
-        const s = Math.min(1, 1280 / video.videoWidth);
-        cv.width = (video.videoWidth * s) | 0; cv.height = (video.videoHeight * s) | 0;
-        cx.drawImage(video, 0, 0, cv.width, cv.height);
+        // una vez el cuadro completo y otra solo el centro con más detalle (ayuda con QR chicos o lejanos)
+        crop = !crop;
+        const vw = video.videoWidth, vh = video.videoHeight, f = crop ? 0.6 : 1;
+        const sw = vw * f, sh = vh * f, s = Math.min(1, 1280 / sw);
+        cv.width = (sw * s) | 0; cv.height = (sh * s) | 0;
+        cx.drawImage(video, (vw - sw) / 2, (vh - sh) / 2, sw, sh, 0, 0, cv.width, cv.height);
         const r = window.jsQR(cx.getImageData(0, 0, cv.width, cv.height).data, cv.width, cv.height, { inversionAttempts: "attemptBoth" });
         return r && isAtrilCode(r.data) ? r.data : "";
       };
@@ -524,9 +571,9 @@
       const dc = this.dc, pc = this.pc; this.dc = this.pc = null;
       try { dc && dc.close(); } catch {} try { pc && pc.close(); } catch {}
     },
-    newPC(role) {
-      this.reset(); this.role = role; this.last = "";
-      const pc = (this.pc = new RTCPeerConnection({ iceServers: [] }));
+    newPC(role, certificates) {
+      this.reset(); this.role = role; this.last = ""; this.quick = false;
+      const pc = (this.pc = new RTCPeerConnection(certificates ? { iceServers: [], certificates } : { iceServers: [] }));
       pc.onconnectionstatechange = () => { if (pc === this.pc && ["failed", "closed"].includes(pc.connectionState)) this.lost(); };
       return pc;
     },
@@ -540,6 +587,8 @@
     opened() {
       Cam.stop(); keepAwake(true);
       if (this.role === "pantalla") {
+        const fp = this.pc && this.pc.remoteDescription ? fpOf(this.pc.remoteDescription.sdp) : "";
+        if (fp) Known.set(fp); // la próxima vez basta con que el teléfono escanee el código del iPad
         toast("Control conectado");
         this.statusT = setInterval(() => this.pushStatus(), 700); this.pushStatus();
       }
@@ -573,57 +622,78 @@
     const b = $("#pRemote"); if (b) b.classList.toggle("on", Link.ok() && Link.role === "pantalla");
   }
 
-  /** iPad: muestra su código, lee el del teléfono con la cámara y queda conectado. */
+  /** iPad: muestra su código y, la primera vez, lee el del teléfono con la cámara.
+   *  Si ya conoce al teléfono, basta con que el teléfono escanee el código del iPad. */
   async function pairScreen() {
     if (!window.RTCPeerConnection) return toast("Este navegador no permite la conexión directa");
-    const d = sheet("Conectar control", `
-      <div class="pair">
+    const d = sheet("Conectar control", `<div class="pair" id="pairBox"></div>`);
+    let done = false, run = 0;
+    d.addEventListener("close", () => { run++; Cam.stop(); if (!done && !Link.ok()) Link.reset(); }, { once: true });
+    Link.onChange = () => { if (Link.ok()) { done = true; d.close(); } };
+
+    const start = async (fresh) => {
+      const my = ++run, known = fresh ? null : Known.get();
+      $("#pairBox", d).innerHTML = `
         <ol class="pair-steps">
           <li>En el teléfono abre Atril → ☰ → <b>Usar como control</b> y escanea este código.</li>
-          <li>Muestra a esta cámara el código que aparece en el teléfono.</li>
+          ${known ? `<li>Listo: este iPad ya conoce tu teléfono y se conecta solo.</li>`
+            : `<li>Muestra a esta cámara el código que aparece en el teléfono.</li>`}
         </ol>
         <div class="pair-grid">
           <div class="qr" id="qr"><div class="empty">Preparando código…</div></div>
           <div class="cam"><video id="cam" playsinline muted></video><span class="cam-msg" id="camMsg">Abriendo cámara…</span></div>
         </div>
         <p class="pair-state" id="pst">Los dos aparatos deben estar en la misma red WiFi o en el hotspot del teléfono (no necesita datos).</p>
+        ${known ? `<div class="row"><button class="btn sm tint" id="other">Usar otro teléfono</button></div>` : ""}
         <details class="pair-manual"><summary>¿No funciona la cámara?</summary>
-          <p class="section-f">Copia este código y pásalo al teléfono, luego pega aquí el que te dé.</p>
+          <p class="section-f">Copia este código y pásalo al teléfono${known ? "" : ", luego pega aquí el que te dé"}.</p>
           <textarea class="field-input code" id="myCode" readonly></textarea>
           <div class="row"><button class="btn sm tint" id="cp">Copiar</button></div>
-          <textarea class="field-input code" id="theirCode" placeholder="Pega aquí el código del teléfono"></textarea>
-          <div class="row"><button class="btn sm fill" id="useCode">Conectar</button></div>
-        </details>
-      </div>`);
-    let done = false;
-    const pst = (t) => { const e = $("#pst", d); if (e) e.textContent = t; };
-    d.addEventListener("close", () => { Cam.stop(); if (!done && !Link.ok()) Link.reset(); }, { once: true });
-    // La cámara se abre antes de crear el código: con la cámara activa el navegador incluye
-    // la dirección real del aparato en la red, y la conexión directa es más confiable.
-    const accept = async (code) => {
-      try {
-        const desc = await unpackSdp(code);
-        if (desc.type !== "answer") { pst("Ese es el código del iPad. Muestra el que aparece en el teléfono."); return false; }
-        if (!Link.pc || Link.pc.signalingState !== "have-local-offer") { pst("Espera a que aparezca el código del iPad."); return false; }
-        pst("Conectando…");
-        await Link.pc.setRemoteDescription(desc);
-        Cam.stop();
-        return true;
-      } catch (e) { pst("No se pudo leer el código: " + e.message); return false; }
+          ${known ? "" : `<textarea class="field-input code" id="theirCode" placeholder="Pega aquí el código del teléfono"></textarea>
+          <div class="row"><button class="btn sm fill" id="useCode">Conectar</button></div>`}
+        </details>`;
+      const pst = (t) => { const e = $("#pst", d); if (e) e.textContent = t; };
+      if (known) $("#other", d).onclick = () => start(true);
+      const accept = async (code) => {
+        if (my !== run) return true;
+        try {
+          const desc = await unpackSdp(code);
+          if (desc.type !== "answer") { pst("Ese es el código del iPad. Muestra el que aparece en el teléfono."); return false; }
+          if (known) { pst("Ese es otro teléfono: toca «Usar otro teléfono»."); return false; }
+          if (!Link.pc || Link.pc.signalingState !== "have-local-offer") { pst("Espera a que aparezca el código del iPad."); return false; }
+          pst("Conectando…");
+          await Link.pc.setRemoteDescription(desc);
+          Cam.stop();
+          return true;
+        } catch (e) { pst("No se pudo leer el código: " + e.message); return false; }
+      };
+      // La cámara se abre antes de crear el código: con la cámara activa el navegador incluye
+      // la dirección real del aparato en la red, y la conexión directa es más confiable.
+      try { await Cam.start($("#cam", d), "user", accept); $("#camMsg", d).textContent = known ? "Cámara lista" : "Apunta aquí el código del teléfono"; }
+      catch (e) { const m = $("#camMsg", d); if (m) m.textContent = e.message || "No se pudo abrir la cámara"; }
+      if (my !== run) return;
+      const pc = Link.newPC("pantalla");
+      Link.bind(pc.createDataChannel("atril", { ordered: true }));
+      await pc.setLocalDescription(await pc.createOffer());
+      await gathered(pc);
+      if (pc !== Link.pc || my !== run) return;
+      let code = null;
+      if (known) {
+        // el iPad arma solo la respuesta del teléfono conocido (sin direcciones: el teléfono llega solo)
+        code = compactSdp(pc.localDescription, [QUICK, ...fpHint(known.fp)]);
+        if (code) {
+          const sdp = pc.localDescription.sdp, ice = derivedIce(sdp);
+          try { await pc.setRemoteDescription({ type: "answer", sdp: buildSdp({ setup: "active", ...ice, mid: sdpGet(sdp, "mid"), fp: known.fp, cands: [] }) }); }
+          catch { code = null; }
+        }
+        if (!code) return start(true); // no se pudo: enlace normal con los dos códigos
+      } else code = await packSdp(pc.localDescription);
+      $("#qr", d).innerHTML = await qrSvg(code);
+      $("#myCode", d).value = code;
+      $("#cp", d).onclick = async () => { try { await navigator.clipboard.writeText(code); toast("Copiado"); } catch { $("#myCode", d).select(); } };
+      if (!known) $("#useCode", d).onclick = () => accept($("#theirCode", d).value);
     };
-    try { await Cam.start($("#cam", d), "user", accept); $("#camMsg", d).textContent = "Apunta aquí el código del teléfono"; }
-    catch (e) { $("#camMsg", d).textContent = e.message || "No se pudo abrir la cámara"; }
-    const pc = Link.newPC("pantalla");
-    Link.bind(pc.createDataChannel("atril", { ordered: true }));
-    Link.onChange = () => { if (Link.ok()) { done = true; d.close(); } };
-    await pc.setLocalDescription(await pc.createOffer());
-    await gathered(pc);
-    if (pc !== Link.pc) return;
-    const code = await packSdp(pc.localDescription);
-    $("#qr", d).innerHTML = await qrSvg(code);
-    $("#myCode", d).value = code;
-    $("#cp", d).onclick = async () => { try { await navigator.clipboard.writeText(code); toast("Copiado"); } catch { $("#myCode", d).select(); } };
-    $("#useCode", d).onclick = () => accept($("#theirCode", d).value);
+    start(false);
   }
 
   // ---- Dropbox: sincroniza un archivo atril-sync.json en tu Dropbox (necesita internet) ----
@@ -1204,6 +1274,7 @@
     setBar({ title: "Control", left: "back", back: "#/notas" });
     const draw = () => {
       if (Link.ok() && Link.role === "control") return drawPad();
+      if (Link.role === "control" && Link.pc && Link.quick) return drawWait();
       if (Link.role === "control" && Link.pc && Link.answer) return drawAnswer();
       drawScan();
     };
@@ -1221,20 +1292,35 @@
             <div class="row"><button class="btn sm fill" id="useCode">Continuar</button></div>
           </details>
         </div>`;
+      const certP = PhoneCert.get(); // la identidad fija de este teléfono (para que el iPad lo recuerde)
       const go = async (code) => {
         try {
           const desc = await unpackSdp(code);
-          if (desc.type !== "offer") { $("#camMsg", el).textContent = "Ese es el código del teléfono. Escanea el del iPad."; return false; }
+          const msg = (t) => { const m = $("#camMsg", el); if (m) m.textContent = t; };
+          if (desc.type !== "offer") { msg("Ese es el código del teléfono. Escanea el del iPad."); return false; }
+          const cert = await certP, mark = desc.extra && desc.extra[0] === QUICK ? desc.extra.slice(1, 3) : null;
+          // el iPad espera a un teléfono conocido: ¿soy yo?
+          const quick = !!mark;
+          if (quick && !(cert && fpHint(PhoneCert.fp(cert)).every((v, k) => v === mark[k]))) {
+            msg("Este iPad recuerda otro teléfono. En el iPad toca «Usar otro teléfono».");
+            return false;
+          }
           if (navigator.vibrate) navigator.vibrate(30);
-          $("#camMsg", el).textContent = "¡Leído! Preparando respuesta…";
-          const pc = Link.newPC("control");
+          msg(quick ? "¡Leído! Conectando…" : "¡Leído! Preparando respuesta…");
+          const pc = Link.newPC("control", cert ? [cert] : null);
           pc.ondatachannel = (e) => Link.bind(e.channel);
           await pc.setRemoteDescription(desc);
-          await pc.setLocalDescription(await pc.createAnswer());
+          let ans = await pc.createAnswer();
+          if (quick) {
+            const ice = derivedIce(desc.sdp);
+            ans = { type: "answer", sdp: ans.sdp.replace(/^a=ice-ufrag:.*$/m, "a=ice-ufrag:" + ice.ufrag).replace(/^a=ice-pwd:.*$/m, "a=ice-pwd:" + ice.pwd) };
+          }
+          await pc.setLocalDescription(ans);
+          if (quick) { Link.quick = true; if (!Link.ok()) draw(); }
           // la cámara sigue prendida hasta aquí: así el teléfono comparte su dirección real en la red
           await gathered(pc);
           Cam.stop();
-          if (pc !== Link.pc) return true;
+          if (pc !== Link.pc || quick) return true;
           Link.answer = await packSdp(pc.localDescription);
           draw();
           return true;
@@ -1244,6 +1330,23 @@
       Cam.start($("#cam", el), "environment", go)
         .then(() => { const m = $("#camMsg", el); if (m) m.textContent = "Apunta al código del iPad"; })
         .catch((e) => { const m = $("#camMsg", el); if (m) m.textContent = e.message || "No se pudo abrir la cámara"; });
+    }
+
+    /** iPad que ya conoce este teléfono: no hay que mostrar nada, solo esperar la conexión. */
+    function drawWait() {
+      el.innerHTML = `
+        <div class="ctl">
+          <h2 class="ctl-h">Conectando con el iPad…</h2>
+          <p class="pair-state" id="wst">El iPad ya conoce este teléfono: no hace falta mostrarle ningún código.</p>
+          <div class="row" style="justify-content:center"><button class="btn sm plain" id="again">Empezar de nuevo</button></div>
+        </div>`;
+      const pc = Link.pc;
+      $("#again", el).onclick = () => { Link.reset(); Link.quick = false; draw(); };
+      setTimeout(() => {
+        if (Link.pc !== pc || Link.ok() || !location.hash.startsWith("#/control")) return;
+        const w = $("#wst", el);
+        if (w) w.innerHTML = "No se pudo conectar. Revisa que los dos estén en la misma red (WiFi o el hotspot de este teléfono) y toca <b>Empezar de nuevo</b>.";
+      }, 12000);
     }
 
     async function drawAnswer() {
@@ -1264,7 +1367,7 @@
     }
 
     function drawPad() {
-      Link.answer = null;
+      Link.answer = null; Link.quick = false;
       el.innerHTML = `
         <div class="ctl pad">
           <div class="ctl-status" id="cst"></div>
