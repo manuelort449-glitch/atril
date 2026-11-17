@@ -2,5 +2,5 @@
 // Para sincronizar por Dropbox, crea una app en https://www.dropbox.com/developers/apps
 // (tipo "Scoped access", acceso "App folder") y pega aquí su "App key". Ver README.md.
 window.ATRIL_CONFIG = {
-  dropboxAppKey: "",
+  dropboxAppKey: "7dw50gx37qd6rrm",
 };

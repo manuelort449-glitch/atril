@@ -634,11 +634,13 @@
     set tok(v) { v ? localStorage.setItem(this.K, JSON.stringify(v)) : localStorage.removeItem(this.K); },
     available() { return !!CFG.dropboxAppKey && window.isSecureContext && !!(window.crypto && crypto.subtle); },
     connected() { return this.available() && !!(this.tok && this.tok.refresh_token); },
-    redirect() { return location.origin + location.pathname; },
+    // siempre la misma dirección (con o sin "index.html"): Dropbox exige que sea idéntica a la registrada
+    redirect() { return location.origin + location.pathname.replace(/[^/]*$/, "") + "index.html"; },
     async connect() {
       const verifier = b64url(crypto.getRandomValues(new Uint8Array(48)));
       const challenge = b64url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))));
-      sessionStorage.setItem("atril:pkce", verifier);
+      // localStorage y no sessionStorage: en el iPad, al volver de Dropbox la app puede abrir en otra pestaña
+      localStorage.setItem("atril:pkce", JSON.stringify({ v: verifier, t: now() }));
       const q = new URLSearchParams({
         client_id: CFG.dropboxAppKey, response_type: "code", code_challenge: challenge, code_challenge_method: "S256",
         token_access_type: "offline", redirect_uri: this.redirect(),
@@ -649,12 +651,15 @@
       const p = new URLSearchParams(location.search); const code = p.get("code");
       if (!code) return;
       history.replaceState(null, "", location.pathname + "#/ajustes");
-      const verifier = sessionStorage.getItem("atril:pkce"); if (!verifier) return;
+      let verifier = null;
+      try { const k = JSON.parse(localStorage.getItem("atril:pkce") || "null"); if (k && now() - k.t < 30 * 60000) verifier = k.v; } catch {}
+      localStorage.removeItem("atril:pkce");
+      if (!verifier) { toast("Vuelve a tocar Conectar Dropbox"); return; }
       const r = await fetch("https://api.dropboxapi.com/oauth2/token", {
         method: "POST",
         body: new URLSearchParams({ grant_type: "authorization_code", code, client_id: CFG.dropboxAppKey, code_verifier: verifier, redirect_uri: this.redirect() }),
       });
-      if (!r.ok) { toast("No se pudo conectar Dropbox"); return; }
+      if (!r.ok) { toast("No se pudo conectar Dropbox (" + r.status + ")"); return; }
       const t = await r.json();
       this.tok = { refresh_token: t.refresh_token, access_token: t.access_token, exp: now() + (t.expires_in - 60) * 1000 };
       toast("Dropbox conectado"); Sync.schedule(100);

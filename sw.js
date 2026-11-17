@@ -1,6 +1,6 @@
 // Service worker: guarda la app en el dispositivo para que abra sin internet.
 // Cambia VERSION cada vez que publiques cambios para que los aparatos se actualicen.
-const VERSION = "atril-v5";
+const VERSION = "atril-v6";
 const FILES = [
   "./", "index.html", "styles.css", "app.js", "config.js", "data/datos.js",
   "manifest.webmanifest", "icon.svg", "icon-180.png", "icon-512.png", "remote.html", "vendor/jsQR.js", "vendor/qrcode.js",
