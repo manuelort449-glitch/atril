@@ -124,6 +124,11 @@ Al terminar y probar los cambios, sube el número de `VERSION` en `sw.js` y úne
 - Armar tanda: toca canciones para agregarlas o quitarlas (✓), reordénalas, incluye letras y,
   en modo ritmo, opcionalmente pon las del mismo ritmo en una sola línea como en tus notas.
 - Lista de canciones con ritmo editable, filtro por ritmo, vista "Por ritmo" y "Solo con letra".
+- **Buscar letra en internet** (gratis, sin cuenta): LRCLIB y Lyrics.ovh. Desde la ficha de la canción o con 🔍 en
+  Armar tanda; toca un resultado para ver la letra debajo y **Usar esta letra**. *Ver en Genius* abre su búsqueda
+  (Genius no entrega letras por su API).
+- En Armar tanda: con **Incluir letras** prendido, cada canción tiene su botón **Letra** para elegir cuáles la llevan
+  (o *Todas* / *Ninguna*). Si escribes una canción que no está, aparece **Agregar «…»** y se busca su letra.
 - Importar ritmos desde `listas/Lista de canciones.txt` (formato `Canción - Ritmo`).
 
 **Buscador tolerante** (Notas, Canciones, Armar tanda, Insertar canción)

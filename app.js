@@ -942,7 +942,7 @@
         const n = touch({ id: "n" + uid(), titulo: "Nuevo guion", texto: "", modificado: today(), orden: topOrder() });
         state.notas.push(n); save(); location.hash = "#/nota/" + n.id;
       } else {
-        draft = { titulo: "", items: [], letras: draft.letras, q: "", ritmo: "*", modo: b.dataset.m };
+        draft = { titulo: "", items: [], letras: draft.letras, noLyr: [], q: "", ritmo: "*", modo: b.dataset.m };
         location.hash = "#/tanda";
       }
     }));
@@ -1000,7 +1000,7 @@
       persist();
       const { ids, unknown } = songsInText(n.texto);
       if (!ids.length) return toast("Esta nota no tiene canciones en líneas con “-”");
-      draft = { titulo: n.titulo + " (por ritmo)", items: ids, letras: draft.letras, q: "", ritmo: "*", modo: "ritmo" };
+      draft = { titulo: n.titulo + " (por ritmo)", items: ids, letras: draft.letras, noLyr: [], q: "", ritmo: "*", modo: "ritmo" };
       location.hash = "#/tanda";
       toast(`${ids.length} canciones cargadas` + (unknown.length ? ` · ${unknown.length} no están en tu lista` : ""));
     };
@@ -1027,8 +1027,8 @@
   }
 
   // ---------- hojas (sheets) ----------
-  function sheet(title, body, { left = "Cerrar", right = "", onRight } = {}) {
-    const d = $("#sheet");
+  function sheet(title, body, { left = "Cerrar", right = "", onRight, el = "#sheet" } = {}) {
+    const d = $(el);
     d.innerHTML = `<div class="grabber"></div><div class="sheet-head">
         <button class="btn plain" data-x>${left}</button><h2>${esc(title)}</h2>
         ${right ? `<button class="btn plain" data-ok style="font-weight:700">${right}</button>` : `<span style="min-width:80px"></span>`}
@@ -1054,6 +1054,98 @@
     $("#pq", d).oninput = draw;
     $("#pls", d).onclick = (e) => { const b = e.target.closest("[data-id]"); if (!b) return; onPick(songById(b.dataset.id), $("#pl", d).checked); d.close(); };
     draw();
+  }
+
+  // ---------- Letras desde internet (gratis y sin cuenta) ----------
+  // LRCLIB (lrclib.net) trae la letra en la búsqueda; Lyrics.ovh sugiere canciones y la letra se pide
+  // al tocarla. Genius no da letras por su API, por eso solo se abre su página para copiar.
+  const Lyrics = {
+    clean(t) {
+      return String(t || "").replace(/\r\n?/g, "\n").split("\n").filter((l) => !/^paroles de la chanson/i.test(l.trim()))
+        .join("\n").replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    },
+    timed(p, ms) { return Promise.race([p, new Promise((_, no) => setTimeout(() => no(new Error("tardó demasiado")), ms))]); },
+    async lrclib(q) {
+      const r = await fetch("https://lrclib.net/api/search?q=" + encodeURIComponent(q));
+      if (!r.ok) throw new Error("LRCLIB " + r.status);
+      return (await r.json()).filter((x) => x.plainLyrics && !x.instrumental).slice(0, 15)
+        .map((x) => ({ fuente: "LRCLIB", titulo: x.trackName, artista: x.artistName, album: x.albumName || "", letra: this.clean(x.plainLyrics) }));
+    },
+    async ovh(q) {
+      const r = await fetch("https://api.lyrics.ovh/suggest/" + encodeURIComponent(q));
+      if (!r.ok) throw new Error("Lyrics.ovh " + r.status);
+      const seen = new Set();
+      return ((await r.json()).data || []).filter((x) => {
+        const k = (x.artist.name + "|" + x.title).toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true;
+      }).slice(0, 8).map((x) => ({
+        fuente: "Lyrics.ovh", titulo: x.title, artista: x.artist.name, album: x.album ? x.album.title : "", letra: null,
+        get: async () => {
+          const g = await this.timed(fetch(`https://api.lyrics.ovh/v1/${encodeURIComponent(x.artist.name)}/${encodeURIComponent(x.title)}`), 20000);
+          const j = g.ok ? await g.json() : {};
+          if (!j.lyrics) throw new Error("Esta fuente no tiene la letra de esa canción");
+          return this.clean(j.lyrics);
+        },
+      }));
+    },
+    async search(q) {
+      const res = await Promise.allSettled([this.timed(this.lrclib(q), 15000), this.timed(this.ovh(q), 15000)]);
+      const items = [], errs = [], seen = new Set();
+      res.forEach((r) => (r.status === "fulfilled" ? items.push(...r.value) : errs.push(r.reason)));
+      return { errs, items: items.filter((x) => { const k = (x.artista + "|" + x.titulo).toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }) };
+    },
+  };
+  /** Busca la letra de una canción y deja elegir cuál usar; muestra la letra debajo del resultado tocado. */
+  function lyricsSheet(nombre, onUse, actual = "") {
+    const d = sheet("Buscar letra", `
+      <div class="group">
+        <label class="cell"><div class="t"><b>Canción</b></div><input type="text" id="lq" value="${esc(nombre)}" placeholder="Nombre de la canción"></label>
+        <label class="cell"><div class="t"><b>Artista</b><span>Opcional, ayuda a encontrarla</span></div><input type="text" id="la" placeholder="ej. Los Ángeles Azules"></label>
+      </div>
+      <div class="row" style="margin-top:10px"><button class="btn fill" id="lgo">${ic("search")} Buscar</button><span class="spacer"></span>
+        <a class="btn plain" id="lgen" target="_blank" rel="noopener">Ver en Genius</a></div>
+      <p class="section-f" id="lst">Busca en LRCLIB y Lyrics.ovh (gratis). Toca un resultado para ver la letra.</p>
+      <div class="group" id="lres"></div>`, { el: "#sheet2" });
+    let items = [];
+    const q = () => [$("#lq", d).value.trim(), $("#la", d).value.trim()].filter(Boolean).join(" ");
+    const st = (t) => ($("#lst", d).textContent = t);
+    const gen = () => ($("#lgen", d).href = "https://genius.com/search?q=" + encodeURIComponent(q() || nombre));
+    const run = async () => {
+      const text = q();
+      gen();
+      if (!text) return st("Escribe el nombre de la canción");
+      if (!navigator.onLine) return st("Sin internet: conéctate para buscar letras.");
+      st("Buscando…"); $("#lres", d).innerHTML = "";
+      const r = await Lyrics.search(text);
+      items = r.items;
+      if (!items.length) return st(r.errs.length === 2 ? "No se pudo buscar (" + r.errs[0].message + "). Revisa el internet." : "No se encontró. Prueba con el artista o con otra forma del nombre, o usa Ver en Genius.");
+      st(`${items.length} resultados. Toca uno para ver la letra.`);
+      $("#lres", d).innerHTML = items.map((x, i) => `<button class="cell" data-i="${i}"><div class="t"><b class="wrap">${esc(x.titulo)}</b>
+          <span>${esc(x.artista)}${x.album ? " · " + esc(x.album) : ""}</span></div><span class="tag lyr">${x.fuente}</span></button>`).join("");
+    };
+    $("#lq", d).oninput = $("#la", d).oninput = gen;
+    $("#lq", d).onkeydown = $("#la", d).onkeydown = (e) => { if (e.key === "Enter") run(); };
+    $("#lgo", d).onclick = run;
+    $("#lres", d).onclick = async (e) => {
+      const use = e.target.closest("[data-use]");
+      if (use) {
+        const x = items[+use.dataset.use];
+        if (actual.trim() && !confirm("Esta canción ya tiene letra. ¿Cambiarla por la nueva?")) return;
+        onUse(x.letra); d.close(); return;
+      }
+      const b = e.target.closest("[data-i]"); if (!b) return;
+      const open = b.nextElementSibling && b.nextElementSibling.classList.contains("lyr-prev");
+      $$(".lyr-prev", d).forEach((x) => x.remove());
+      if (open) return;
+      const i = +b.dataset.i, x = items[i];
+      b.insertAdjacentHTML("afterend", `<div class="lyr-prev"><div class="empty">Cargando letra…</div></div>`);
+      const box = b.nextElementSibling;
+      try { if (x.letra == null) x.letra = await x.get(); }
+      catch (err) { box.innerHTML = `<div class="empty">${esc(err.message)}</div>`; return; }
+      box.innerHTML = `<pre class="lyr-text">${esc(x.letra)}</pre>
+        <div class="row"><span class="small muted">${esc(x.fuente)}</span><span class="spacer"></span><button class="btn fill sm" data-use="${i}">Usar esta letra</button></div>`;
+    };
+    gen();
+    if (nombre.trim()) run();
   }
 
   // ---------- Canciones ----------
@@ -1126,7 +1218,8 @@
       </div>
       <datalist id="ritmosList2">${state.ritmos.map((r) => `<option value="${esc(r)}">`).join("")}</datalist>
       <div class="section-h">Letra</div>
-      <textarea class="editor" id="sl" style="min-height:34vh" placeholder="Pega aquí la letra">${esc(c.letra)}</textarea>
+      <div class="row" style="margin:0 0 8px"><button class="btn sm tint" id="sls">${ic("search")} Buscar letra en internet</button></div>
+      <textarea class="editor" id="sl" style="min-height:34vh" placeholder="Pega aquí la letra o búscala en internet">${esc(c.letra)}</textarea>
       ${isNew ? "" : `<p class="section-f">Aparece en: ${esc((c.notas || []).join(", ") || "ninguna nota")}</p>
       <div class="row" style="margin-top:16px"><button class="btn tint" id="sp">${ic("play")} Ver en prompter</button><span class="spacer"></span>
         <button class="btn danger" id="sd">${ic("trash")} Borrar</button></div>`}`,
@@ -1135,6 +1228,7 @@
         c.nombre = nombre; c.tono = $("#st", d).value.trim().toUpperCase(); c.ritmo = $("#sr", d).value.trim(); c.letra = $("#sl", d).value;
         addRitmo(c.ritmo); touch(c); if (isNew) state.canciones.push(c); save(); after && after(); toast("Guardado");
       } });
+    $("#sls", d).onclick = () => lyricsSheet($("#sn", d).value.trim() || c.nombre, (t) => { $("#sl", d).value = t; toast("Letra lista: toca Guardar"); }, $("#sl", d).value);
     if (!isNew) {
       $("#sp", d).onclick = () => { d.close(); location.hash = "#/prompter/" + encodeURIComponent("song:" + c.id); };
       $("#sd", d).onclick = () => {
@@ -1147,7 +1241,10 @@
   // ---------- Armar tanda ----------
   // modo "orden": las canciones quedan en el orden que tú elijas.
   // modo "ritmo": se agrupan solas por ritmo (cumbias juntas, rancheras juntas…).
-  let draft = { titulo: "", items: [], letras: true, q: "", ritmo: "*", modo: "orden", juntas: false };
+  // noLyr: canciones de la tanda que van sin letra aunque la tengan (cuando "Incluir letras" está prendido)
+  let draft = { titulo: "", items: [], letras: true, noLyr: [], q: "", ritmo: "*", modo: "orden", juntas: false };
+  const hasLyr = (c) => !!(c && c.letra && c.letra.trim());
+  const withLyr = (c) => draft.letras && hasLyr(c) && !(draft.noLyr || []).includes(c.id);
   let tempText = null;
   const SIN_RITMO = "Sin ritmo";
   function groupsByRitmo(ids) {
@@ -1156,14 +1253,14 @@
     return [...g.entries()].sort(([a], [b]) => (a === SIN_RITMO) - (b === SIN_RITMO) || a.localeCompare(b, "es"));
   }
   function tandaText() {
-    const block = (c) => songBlock(c, draft.letras);
+    const block = (c) => songBlock(c, withLyr(c));
     if (draft.modo !== "ritmo") return draft.items.map(songById).filter(Boolean).map(block).join("\n\n");
     return groupsByRitmo(draft.items).map(([ritmo, songs]) => {
       const head = "TANDA · " + ritmo.toUpperCase();
       if (!draft.juntas) return head + "\n\n" + songs.map(block).join("\n\n");
       // todas las del mismo ritmo en una línea, como en tus notas: -Eva María LAB/Azúcar DO
       const line = "-" + songs.map((c) => c.nombre + (c.tono ? " " + c.tono : "")).join("/");
-      const lyr = draft.letras ? songs.filter((c) => c.letra).map((c) => c.letra.trim()).join("\n\nMÚSICA\n\n") : "";
+      const lyr = songs.filter(withLyr).map((c) => c.letra.trim()).join("\n\nMÚSICA\n\n");
       return head + "\n\n" + line + (lyr ? "\n\n" + lyr : "");
     }).join("\n\n\n");
   }
@@ -1181,7 +1278,7 @@
         <div>
           <div class="group">
             <label class="cell"><div class="t"><b>Nombre</b></div><input type="text" id="tit" placeholder="ej. Boda sábado" value="${esc(draft.titulo)}"></label>
-            <label class="cell"><div class="t"><b>Incluir letras</b><span>Cuando la canción tenga letra guardada</span></div><input type="checkbox" class="switch" id="lt" ${draft.letras ? "checked" : ""}></label>
+            <label class="cell"><div class="t"><b>Incluir letras</b><span>Luego elige en la tanda cuáles sí llevan letra</span></div><input type="checkbox" class="switch" id="lt" ${draft.letras ? "checked" : ""}></label>
             <label class="cell" id="juntasRow"><div class="t"><b>Mismo ritmo en una línea</b><span>-Canción LAB/Canción DO, como en tus notas</span></div><input type="checkbox" class="switch" id="jt" ${draft.juntas ? "checked" : ""}></label>
           </div>
           <div class="section-h" id="setH">Tanda</div>
@@ -1202,28 +1299,41 @@
     const drawSrc = () => {
       const base = alive(state.canciones).filter((c) => draft.ritmo === "*" || c.ritmo === draft.ritmo).sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
       const items = Search.rank(base, draft.q, (c) => [[c.nombre, 1.2], [`${c.ritmo || ""} ${c.tono || ""}`, 0.9], [c.letra || "", 0.6]]);
-      $("#src", el).innerHTML = items.map((c) => {
+      const qn = plain(draft.q);
+      const nueva = qn && !alive(state.canciones).some((c) => plain(c.nombre) === qn)
+        ? `<button class="cell new-song" data-new><span class="add-dot">${ic("plus")}</span><div class="t"><b>Agregar «${esc(draft.q.trim())}»</b><span>Canción nueva: se agrega a la tanda y puedes buscar su letra</span></div></button>` : "";
+      $("#src", el).innerHTML = nueva + items.map((c) => {
         const on = draft.items.includes(c.id);
         return `<button class="cell" data-id="${esc(c.id)}" aria-pressed="${on}">
           <div class="t"><b>${esc(c.nombre)}</b><span>${esc(c.ritmo || SIN_RITMO)}${c.letra ? " · con letra" : ""}</span></div>
           ${c.tono ? `<span class="tag key">${esc(c.tono)}</span>` : ""}<span class="add-dot ${on ? "on" : ""}">${ic(on ? "check" : "plus")}</span></button>`;
-      }).join("") || `<div class="empty">Nada que mostrar.</div>`;
+      }).join("") || (nueva ? "" : `<div class="empty">Nada que mostrar.</div>`);
     };
-    const row = (c, first, last, n) => `<div class="cell" data-id="${esc(c.id)}"><span class="num">${n}</span><div class="t"><b>${esc(c.nombre)}</b></div>
-        ${c.tono ? `<span class="tag key">${esc(c.tono)}</span>` : ""}
+    const row = (c, first, last, n) => {
+      const has = hasLyr(c), on = withLyr(c);
+      const sub = !has ? "Sin letra guardada" : !draft.letras ? "Tiene letra" : on ? "Con letra en esta tanda" : "Va sin letra en esta tanda";
+      return `<div class="cell" data-id="${esc(c.id)}"><span class="num">${n}</span>
+        <div class="t tap" data-ed style="cursor:pointer"><b>${esc(c.nombre)}</b><span>${sub}</span></div>
+        <div class="acts">${c.tono ? `<span class="tag key">${esc(c.tono)}</span>` : ""}
+        ${has && draft.letras ? `<button class="btn sm lyr-tg ${on ? "on" : ""}" data-lt aria-pressed="${on}" aria-label="Incluir la letra de ${esc(c.nombre)}">${on ? "✓ " : ""}Letra</button>` : ""}
+        <button class="btn sm icon" data-ls aria-label="Buscar letra de ${esc(c.nombre)}" title="Buscar letra">${ic("search")}</button>
         <button class="btn sm icon" data-mv="-1" aria-label="Subir" ${first ? "disabled" : ""}>${ic("up")}</button>
         <button class="btn sm icon" data-mv="1" aria-label="Bajar" ${last ? "disabled" : ""}>${ic("down")}</button>
-        <button class="btn sm icon danger" data-rm aria-label="Quitar">${ic("close")}</button></div>`;
+        <button class="btn sm icon danger" data-rm aria-label="Quitar">${ic("close")}</button></div></div>`;
+    };
     const drawSet = () => {
       $("#setH", el).textContent = `Tanda · ${draft.items.length} canciones`;
+      const conLetra = draft.items.map(songById).filter(hasLyr).length;
+      const bulk = draft.letras && conLetra ? `<div class="row small" style="margin:0 4px 8px"><span class="muted">${draft.items.map(songById).filter(withLyr).length} de ${conLetra} con letra</span><span class="spacer"></span>
+        <button class="btn sm plain" data-all="1">Todas</button><button class="btn sm plain" data-all="0">Ninguna</button></div>` : "";
       if (!draft.items.length) { $("#set", el).innerHTML = `<div class="group" style="margin-top:0"><div class="empty">Toca canciones de la lista para agregarlas.</div></div>`; return; }
       if (draft.modo === "ritmo") {
         let n = 0;
-        $("#set", el).innerHTML = groupsByRitmo(draft.items).map(([ritmo, songs]) =>
+        $("#set", el).innerHTML = bulk + groupsByRitmo(draft.items).map(([ritmo, songs]) =>
           `<div class="section-h">${esc(ritmo)} · ${songs.length}</div><div class="group" style="margin-top:0">${
             songs.map((c, i) => row(c, i === 0, i === songs.length - 1, ++n)).join("")}</div>`).join("");
       } else {
-        $("#set", el).innerHTML = `<div class="group" style="margin-top:0">${draft.items.map(songById).filter(Boolean)
+        $("#set", el).innerHTML = bulk + `<div class="group" style="margin-top:0">${draft.items.map(songById).filter(Boolean)
           .map((c, i, arr) => row(c, i === 0, i === arr.length - 1, i + 1)).join("")}</div>`;
       }
     };
@@ -1231,7 +1341,22 @@
     $("#modo", el).onclick = (e) => { const b = e.target.closest("[data-m]"); if (b) { draft.modo = b.dataset.m; redraw(); } };
     $("#q", el).oninput = (e) => { draft.q = e.target.value; drawSrc(); };
     $("#rits", el).onclick = (e) => { const b = e.target.closest("[data-r]"); if (!b) return; draft.ritmo = b.dataset.r; drawTop(); drawSrc(); };
+    // guarda la letra encontrada en la canción (queda para siempre en tu lista de canciones)
+    const findLyrics = (c) => lyricsSheet(c.nombre, (t) => {
+      c.letra = t; touch(c); save();
+      draft.noLyr = (draft.noLyr || []).filter((x) => x !== c.id);
+      if (!draft.letras) { draft.letras = true; $("#lt", el).checked = true; }
+      toast("Letra guardada: " + c.nombre); drawSrc(); drawSet();
+    }, c.letra || "");
     $("#src", el).onclick = (e) => {
+      if (e.target.closest("[data-new]")) {
+        const c = touch({ id: "c-" + uid(), nombre: draft.q.trim(), tono: "", ritmo: draft.ritmo !== "*" ? draft.ritmo : "", letra: "", notas: [] });
+        state.canciones.push(c); save();
+        draft.items.push(c.id); draft.q = ""; $("#q", el).value = "";
+        drawSrc(); drawSet(); toast("Agregada: " + c.nombre);
+        findLyrics(c);
+        return;
+      }
       const b = e.target.closest("[data-id]"); if (!b) return;
       const id = b.dataset.id, c = songById(id), at = draft.items.indexOf(id);
       if (at >= 0) { draft.items.splice(at, 1); toast("Quitada: " + c.nombre); }
@@ -1239,9 +1364,17 @@
       drawSrc(); drawSet();
     };
     $("#set", el).onclick = (e) => {
+      const all = e.target.closest("[data-all]");
+      if (all) { draft.noLyr = all.dataset.all === "1" ? [] : draft.items.slice(); drawSet(); return; }
       const r = e.target.closest("[data-id]"); if (!r) return;
       const id = r.dataset.id, i = draft.items.indexOf(id);
       if (e.target.closest("[data-rm]")) { draft.items.splice(i, 1); drawSrc(); drawSet(); return; }
+      if (e.target.closest("[data-lt]")) {
+        const nl = draft.noLyr || (draft.noLyr = []), k = nl.indexOf(id);
+        k >= 0 ? nl.splice(k, 1) : nl.push(id); drawSet(); return;
+      }
+      if (e.target.closest("[data-ls]")) { findLyrics(songById(id)); return; }
+      if (e.target.closest("[data-ed]")) { editSong(id, () => { drawSrc(); drawSet(); }); return; }
       const mv = e.target.closest("[data-mv]"); if (!mv) return;
       const dir = +mv.dataset.mv;
       // en modo ritmo se mueve dentro de su grupo (salta las de otros ritmos)
@@ -1251,7 +1384,7 @@
       drawSet();
     };
     $("#tit", el).oninput = (e) => (draft.titulo = e.target.value);
-    $("#lt", el).onchange = (e) => (draft.letras = e.target.checked);
+    $("#lt", el).onchange = (e) => { draft.letras = e.target.checked; drawSet(); };
     $("#jt", el).onchange = (e) => (draft.juntas = e.target.checked);
     $("#clr", el).onclick = () => { if (draft.items.length && confirm("¿Vaciar la tanda?")) { draft.items = []; drawSrc(); drawSet(); } };
     $("#prev", el).onclick = () => { if (!draft.items.length) return toast("La tanda está vacía"); tempText = { titulo: draft.titulo || "Tanda (prueba)", texto: tandaText() }; location.hash = "#/prompter/tmp"; };
@@ -1260,7 +1393,7 @@
       const n = touch({ id: "n" + uid(), titulo: draft.titulo.trim() || "Tanda " + fmtDate(today()), texto: tandaText(), modificado: today(), orden: topOrder() });
       draft.items.forEach((id) => { const c = songById(id); if (c && !(c.notas || []).includes(n.titulo)) { c.notas = [...(c.notas || []), n.titulo]; touch(c); } });
       state.notas.push(n); save();
-      draft = { titulo: "", items: [], letras: draft.letras, q: "", ritmo: "*", modo: draft.modo, juntas: draft.juntas };
+      draft = { titulo: "", items: [], letras: draft.letras, noLyr: [], q: "", ritmo: "*", modo: draft.modo, juntas: draft.juntas };
       toast("Nota guardada"); location.hash = "#/nota/" + n.id;
     };
     redraw();
